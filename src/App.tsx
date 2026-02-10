@@ -1010,7 +1010,7 @@ export default function App() {
         </div>
 
         <footer className="footer">
-          <i className="ri-video-fill"></i> Dreamcodec v2.2.1 • Made by Thornvald
+          <i className="ri-video-fill"></i> Dreamcodec v2.2.2 • Made by Thornvald
         </footer>
       </div>
     </>

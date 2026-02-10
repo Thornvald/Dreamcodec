@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.2] - 2026-02-10
+
+### Added
+- CPU diagnostics in logs (model and logical core count)
+- Full GPU adapter logging in UI logs, including integrated adapters and primary marker
+- Preferred GPU controls now surface clearer adapter-level visibility for diagnostics
+
+### Fixed
+- Preserved identical GPU model entries so dual-GPU same-model systems are represented correctly
+- Stable GPU adapter IDs now map correctly to FFmpeg NVENC `-gpu` indexes
+
+### Improved
+- Top header and side panel transparency to better expose animated star background
+
 ## [2.2.1] - 2026-02-02
 
 ### Fixed
