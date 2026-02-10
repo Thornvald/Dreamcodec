@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import StarBackground from "./components/StarBackground";
 import "remixicon/fonts/remixicon.css";
 
@@ -70,6 +71,8 @@ interface ConversionProgress {
   error_message?: string | null;
 }
 
+const SUPPORTED_INPUT_EXTENSIONS = new Set(["mkv", "mp4", "avi", "mov", "wmv", "flv", "webm"]);
+
 export default function App() {
   const [activeTab, setActiveTab] = useState("queue");
   const [outputDir, setOutputDir] = useState("");
@@ -86,6 +89,8 @@ export default function App() {
   const [conversions, setConversions] = useState<ConversionItem[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isDragOverlayVisible, setIsDragOverlayVisible] = useState(false);
+  const [draggedFileCount, setDraggedFileCount] = useState(0);
   const conversionsRef = useRef<ConversionItem[]>([]);
   const pollerRef = useRef<number | null>(null);
 
@@ -253,6 +258,40 @@ export default function App() {
 
   const getFileName = (path: string) => {
     return path.split(/[/\\]/).pop() || path;
+  };
+
+  const addFilesToQueue = (paths: string[]) => {
+    if (paths.length === 0) return;
+
+    const uniquePaths = Array.from(new Set(paths));
+    const validPaths = uniquePaths.filter((path) => {
+      const ext = getFileExt(getFileName(path));
+      return SUPPORTED_INPUT_EXTENSIONS.has(ext);
+    });
+    const skippedCount = uniquePaths.length - validPaths.length;
+    if (skippedCount > 0) {
+      addLog(`Skipped ${skippedCount} unsupported file(s).`);
+    }
+    if (validPaths.length === 0) return;
+
+    const newFiles: QueueFile[] = validPaths.map((path) => ({
+      path,
+      name: getFileName(path),
+    }));
+
+    setQueue((prev) => {
+      const existingPaths = new Set(prev.map((file) => file.path));
+      const merged = [...prev];
+
+      for (const file of newFiles) {
+        if (!existingPaths.has(file.path)) {
+          merged.push(file);
+          existingPaths.add(file.path);
+        }
+      }
+
+      return merged;
+    });
   };
 
   const getFileDir = (path: string) => {
@@ -540,6 +579,59 @@ export default function App() {
     setDefaultOutputDir();
   }, [outputDir]);
 
+  useEffect(() => {
+    const appWindow = getCurrentWindow();
+    let unlisten: (() => void) | null = null;
+    let active = true;
+
+    void appWindow.onDragDropEvent((event) => {
+      if (!active) return;
+      const payload = event.payload;
+
+      if (payload.type === "enter") {
+        setIsDragOverlayVisible(true);
+        setDraggedFileCount(payload.paths.length);
+        return;
+      }
+
+      if (payload.type === "over") {
+        setIsDragOverlayVisible(true);
+        return;
+      }
+
+      if (payload.type === "leave") {
+        setIsDragOverlayVisible(false);
+        setDraggedFileCount(0);
+        return;
+      }
+
+      if (payload.type === "drop") {
+        setIsDragOverlayVisible(false);
+        setDraggedFileCount(0);
+
+        if (payload.paths.length > 0) {
+          addFilesToQueue(payload.paths);
+          addLog(`Added ${payload.paths.length} file(s) via drag and drop.`);
+        }
+      }
+    }).then((fn) => {
+      if (!active) {
+        fn();
+        return;
+      }
+      unlisten = fn;
+    }).catch((err) => {
+      addLog(`Drag and drop initialization failed: ${String(err)}`);
+    });
+
+    return () => {
+      active = false;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, []);
+
   const handleSelectOutputDir = async () => {
     try {
       const selected = await open({
@@ -673,11 +765,7 @@ export default function App() {
 
       if (selected) {
         const files = Array.isArray(selected) ? selected : [selected];
-        const newFiles = files.map(path => ({
-          path,
-          name: path.split(/[/\\]/).pop() || path,
-        }));
-        setQueue(prev => [...prev, ...newFiles]);
+        addFilesToQueue(files);
       }
     } catch (err) {
       console.error("Failed to select files:", err);
@@ -695,6 +783,19 @@ export default function App() {
   return (
     <>
       <StarBackground />
+      {isDragOverlayVisible && (
+        <div className="drag-overlay" aria-hidden="true">
+          <div className="drag-overlay-panel">
+            <i className="ri-file-upload-fill drag-overlay-icon"></i>
+            <h2 className="drag-overlay-title">
+              {draggedFileCount > 0
+                ? `Drop ${draggedFileCount} file${draggedFileCount > 1 ? "s" : ""} here`
+                : "Drop files here"}
+            </h2>
+            <p className="drag-overlay-subtitle">Release to add files to the queue</p>
+          </div>
+        </div>
+      )}
 
       <div className="app">
         <header className="header">
@@ -1010,7 +1111,7 @@ export default function App() {
         </div>
 
         <footer className="footer">
-          <i className="ri-video-fill"></i> Dreamcodec v2.2.2 • Made by Thornvald
+          <i className="ri-video-fill"></i> Dreamcodec v2.2.4 • Made by Thornvald
         </footer>
       </div>
     </>

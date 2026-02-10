@@ -2,7 +2,7 @@
 
 A modern desktop application for converting video and audio files with GPU hardware acceleration and Adobe/After Effects compatibility. Built with Tauri 2, React + TypeScript, and Rust.
 
-![Version](https://img.shields.io/badge/version-2.2.1-blue.svg)
+![Version](https://img.shields.io/badge/version-2.2.4-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
 
@@ -11,7 +11,8 @@ A modern desktop application for converting video and audio files with GPU hardw
 ## Features
 
 - **All-in-One Converter**: Convert between any video/audio formats - MP4, MKV, AVI, MOV, WMV, FLV, WEBM, MP3, WAV, AAC, FLAC, M4A, and more
-- **GPU Hardware Acceleration**: Automatically detects and uses NVIDIA NVENC, AMD AMF, or Intel Quick Sync Video encoders
+- **GPU Hardware Acceleration**: Automatically detects NVIDIA/AMD/Intel adapters (including integrated GPUs), with adapter selection for hardware encoding
+- **Native Drag & Drop**: OS-level drag/drop support with full-screen "Drop files here" overlay feedback
 - **Adobe/After Effects Compatible**: Export to ProRes, DNxHD, DNxHR, and CineForm formats for professional workflows
 - **Auto FFmpeg Detection**: Automatically finds FFmpeg from bundled, PATH, common locations, or WinGet installations
 - **Batch Conversion**: Add multiple files to a queue for sequential conversion
@@ -89,7 +90,8 @@ npm run tauri build
    - **Adobe Mode**: Enable for professional codecs (ProRes, DNxHD, etc.)
 
 5. **Add Files**
-   - Click "Add Files" or drag and drop video files
+   - Click "Add Files" or drag and drop video files anywhere on the window
+   - A full-screen drop overlay appears while dragging files over the app
    - Supported: MKV, MP4, AVI, MOV, WMV, FLV, WEBM, and more
 
 6. **Start Conversion**
@@ -139,6 +141,7 @@ For best compatibility with Adobe software:
 - Ensure your GPU drivers are up to date
 - Some older GPUs may not support hardware encoding
 - The app will fall back to CPU encoding if GPU encoding is unavailable
+- Check the Logs tab for detected CPU and all GPU adapters, plus selected adapter index mapping
 
 ### Adobe format issues
 - ProRes encoding requires FFmpeg with ProRes support (included in auto-download)

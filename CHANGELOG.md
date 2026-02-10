@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.4] - 2026-02-10
+
+### Added
+- Native Tauri window drag-and-drop event handling for reliable filesystem path detection
+- Full-screen drag state overlay blocks interaction and clearly indicates active file drop mode
+
+### Improved
+- Drag/drop visuals updated to monochrome black theme with white glow animation
+- README updated with current features, drag/drop behavior, and GPU diagnostics notes
+
+## [2.2.3] - 2026-02-10
+
+### Added
+- Full-screen drag-and-drop overlay with animated file-drop state
+
+### Improved
+- NVENC path now attempts CUDA hardware decode + GPU encode for lower CPU usage
+- Added runtime fallback logging when CUDA decode cannot initialize
+
 ## [2.2.2] - 2026-02-10
 
 ### Added

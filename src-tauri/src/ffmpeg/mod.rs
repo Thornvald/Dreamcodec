@@ -803,7 +803,21 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
     };
 
     // Build FFmpeg command
-    let mut args = vec!["-y".to_string(), "-i".to_string(), input_file.clone()];
+    let mut args = vec!["-y".to_string()];
+
+    // When NVENC is selected, also try to decode on GPU to avoid CPU-heavy software decode.
+    if encoder.contains("nvenc") {
+        args.push("-hwaccel".to_string());
+        args.push("cuda".to_string());
+        args.push("-hwaccel_output_format".to_string());
+        args.push("cuda".to_string());
+        if let Some(index) = gpu_index {
+            args.push("-hwaccel_device".to_string());
+            args.push(index.to_string());
+        }
+    }
+    args.push("-i".to_string());
+    args.push(input_file.clone());
 
     // Add stream mapping for video formats
     let output_ext = Path::new(&output_file)
@@ -866,8 +880,6 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
                     args.push("-gpu".to_string());
                     args.push(index.to_string());
                 }
-                args.push("-pix_fmt".to_string());
-                args.push("yuv420p".to_string());
             }
         }
 
@@ -888,6 +900,14 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
     {
         let mut task = task_arc.lock().unwrap();
         task.progress.status = ConversionStatus::Running;
+        if encoder.contains("nvenc") {
+            task.progress
+                .log
+                .push("NVENC selected: attempting CUDA hardware decode + GPU encode.".to_string());
+        }
+        task.progress
+            .log
+            .push(format!("FFmpeg args: {}", args.join(" ")));
     }
 
     // Run FFmpeg
@@ -898,20 +918,66 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
     println!("Input: {}", input_file);
     println!("Output: {}", output_file);
     println!("Args: {:?}", args);
-    let mut cmd = Command::new(&ffmpeg_path);
-    cmd.args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    let child = match cmd.spawn() {
+    let spawn_ffmpeg = |use_hwaccel: bool| -> Result<Child, std::io::Error> {
+        let actual_args = if use_hwaccel {
+            args.clone()
+        } else {
+            // Fallback args remove explicit CUDA decode flags, keeping NVENC encode enabled.
+            let mut filtered: Vec<String> = Vec::with_capacity(args.len());
+            let mut i = 0;
+            while i < args.len() {
+                let arg = &args[i];
+                if arg == "-hwaccel" || arg == "-hwaccel_output_format" || arg == "-hwaccel_device" {
+                    i += 2;
+                    continue;
+                }
+                filtered.push(arg.clone());
+                i += 1;
+            }
+            filtered
+        };
+
+        let mut cmd = Command::new(&ffmpeg_path);
+        cmd.args(&actual_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.spawn()
+    };
+
+    let child = match spawn_ffmpeg(true) {
         Ok(child) => child,
-        Err(e) => {
-            let mut task = task_arc.lock().unwrap();
-            let message = format!("Failed to start ffmpeg: {} (path: {})", e, ffmpeg_path);
-            task.progress.status = ConversionStatus::Failed(message.clone());
-            task.progress.error_message = Some(message);
-            return;
+        Err(first_err) => {
+            if encoder.contains("nvenc") {
+                println!("CUDA decode path failed to start, retrying without CUDA decode flags: {}", first_err);
+                {
+                    let mut task = task_arc.lock().unwrap();
+                    task.progress.log.push(format!(
+                        "CUDA decode start failed ({}). Retrying with GPU encode + software decode.",
+                        first_err
+                    ));
+                }
+                match spawn_ffmpeg(false) {
+                    Ok(child) => child,
+                    Err(second_err) => {
+                        let mut task = task_arc.lock().unwrap();
+                        let message = format!(
+                            "Failed to start ffmpeg: {} (fallback also failed: {}) (path: {})",
+                            first_err, second_err, ffmpeg_path
+                        );
+                        task.progress.status = ConversionStatus::Failed(message.clone());
+                        task.progress.error_message = Some(message);
+                        return;
+                    }
+                }
+            } else {
+                let mut task = task_arc.lock().unwrap();
+                let message = format!("Failed to start ffmpeg: {} (path: {})", first_err, ffmpeg_path);
+                task.progress.status = ConversionStatus::Failed(message.clone());
+                task.progress.error_message = Some(message);
+                return;
+            }
         }
     };
 
