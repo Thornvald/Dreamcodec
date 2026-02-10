@@ -85,9 +85,9 @@ body {
 /* Header */
 .header {
   padding: 1.5rem 2rem;
-  background: rgba(17, 17, 17, 0.45);
+  background: rgba(0, 0, 0, 0.08);
   backdrop-filter: blur(20px);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -134,9 +134,9 @@ body {
 .sidebar {
   width: 320px;
   padding: 1.5rem;
-  background: rgba(17, 17, 17, 0.35);
+  background: rgba(0, 0, 0, 0.08);
   backdrop-filter: blur(20px);
-  border-right: 1px solid rgba(255, 255, 255, 0.08);
+  border-right: 1px solid rgba(255, 255, 255, 0.05);
   overflow-y: auto;
 }
 
@@ -157,9 +157,9 @@ body {
 /* Tabs */
 .tabs {
   display: flex;
-  background: rgba(17, 17, 17, 0.45);
+  background: rgba(0, 0, 0, 0.08);
   backdrop-filter: blur(20px);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
 }
 
 .tab {

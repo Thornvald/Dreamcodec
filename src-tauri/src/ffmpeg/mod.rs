@@ -638,6 +638,7 @@ pub struct ConversionTask {
     pub output_file: String,
     pub ffmpeg_path: String,
     pub encoder: String,
+    pub gpu_index: Option<u32>,
     pub preset: String,
     pub is_adobe_preset: bool,
     pub adobe_preset: Option<AdobePreset>,
@@ -664,6 +665,7 @@ impl FfmpegManager {
         output_file: String,
         ffmpeg_path: String,
         encoder: String,
+        gpu_index: Option<u32>,
         preset: String,
         is_adobe_preset: bool,
     ) -> Result<(), String> {
@@ -691,6 +693,7 @@ impl FfmpegManager {
             output_file: output_file.clone(),
             ffmpeg_path: ffmpeg_path.clone(),
             encoder: encoder.clone(),
+            gpu_index,
             preset: preset.clone(),
             is_adobe_preset,
             adobe_preset,
@@ -785,13 +788,14 @@ fn kill_process(pid: u32) {
 }
 
 async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
-    let (input_file, output_file, ffmpeg_path, encoder, preset, is_adobe_preset, adobe_preset) = {
+    let (input_file, output_file, ffmpeg_path, encoder, gpu_index, preset, is_adobe_preset, adobe_preset) = {
         let task = task_arc.lock().unwrap();
         (
             task.input_file.clone(),
             task.output_file.clone(),
             task.ffmpeg_path.clone(),
             task.encoder.clone(),
+            task.gpu_index,
             task.preset.clone(),
             task.is_adobe_preset,
             task.adobe_preset.clone(),
@@ -858,6 +862,10 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
 
             // Add pixel format for NVENC
             if encoder.contains("nvenc") {
+                if let Some(index) = gpu_index {
+                    args.push("-gpu".to_string());
+                    args.push(index.to_string());
+                }
                 args.push("-pix_fmt".to_string());
                 args.push("yuv420p".to_string());
             }

@@ -1,10 +1,11 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import StarBackground from "./components/StarBackground";
 import "remixicon/fonts/remixicon.css";
 
 type EncoderType = "Cpu" | "GpuNvidia" | "GpuAmd" | "GpuIntel" | "Adobe";
+type GpuType = "Nvidia" | "Intel" | "Amd" | "Unknown" | "None";
 
 interface Encoder {
   name: string;
@@ -13,11 +14,25 @@ interface Encoder {
   encoder_type: EncoderType;
 }
 
+interface GpuAdapter {
+  id: string;
+  name: string;
+  gpu_type: GpuType;
+  is_virtual: boolean;
+}
+
 interface GpuInfo {
   detected: boolean;
-  gpu_type: string;
+  gpu_type: GpuType;
   name: string;
+  primary_adapter_id?: string | null;
+  adapters: GpuAdapter[];
   available_encoders: Encoder[];
+}
+
+interface GpuPreferenceOption {
+  value: string;
+  label: string;
 }
 
 interface FfmpegStatus {
@@ -25,6 +40,11 @@ interface FfmpegStatus {
   path?: string;
   version?: string;
   source?: string;
+}
+
+interface CpuInfo {
+  name: string;
+  logical_cores: number;
 }
 
 interface QueueFile {
@@ -58,6 +78,10 @@ export default function App() {
   const [outputFormat, setOutputFormat] = useState("mp4");
   const [queue, setQueue] = useState<QueueFile[]>([]);
   const [encoders, setEncoders] = useState<Encoder[]>([]);
+  const [allEncoders, setAllEncoders] = useState<Encoder[]>([]);
+  const [gpuInfo, setGpuInfo] = useState<GpuInfo | null>(null);
+  const [gpuPreference, setGpuPreference] = useState("auto");
+  const [cpuInfo, setCpuInfo] = useState<CpuInfo | null>(null);
   const [gpuName, setGpuName] = useState("");
   const [conversions, setConversions] = useState<ConversionItem[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
@@ -111,8 +135,120 @@ export default function App() {
     }
   };
 
-  const isVirtualGpu = (name: string) => {
-    return /(virtual|remote|basic display|microsoft basic|indirect display|displaylink|rdp|vmware|virtualbox|parallels|citrix|xen|dummy)/i.test(name);
+  const getEncoderType = (enc: Encoder): string => {
+    switch (enc.encoder_type) {
+      case "GpuNvidia": return "NVIDIA GPU";
+      case "GpuAmd": return "AMD GPU";
+      case "GpuIntel": return "Intel GPU";
+      case "Adobe": return "Professional";
+      case "Cpu": return "CPU";
+      default: return "Unknown";
+    }
+  };
+
+  const getGpuTypeLabel = (gpuType: GpuType): string => {
+    switch (gpuType) {
+      case "Nvidia":
+        return "NVIDIA";
+      case "Amd":
+        return "AMD";
+      case "Intel":
+        return "Intel";
+      case "Unknown":
+        return "Unknown";
+      case "None":
+        return "None";
+      default:
+        return "Unknown";
+    }
+  };
+
+  const encoderMatchesGpuType = (enc: Encoder, gpuType: GpuType) => {
+    if (gpuType === "Nvidia") return enc.encoder_type === "GpuNvidia";
+    if (gpuType === "Amd") return enc.encoder_type === "GpuAmd";
+    if (gpuType === "Intel") return enc.encoder_type === "GpuIntel";
+    return false;
+  };
+
+  const isCpuLikeEncoder = (enc: Encoder) =>
+    enc.encoder_type === "Cpu" || enc.encoder_type === "Adobe";
+
+  const pickDefaultEncoder = (available: Encoder[], preferredGpuType?: GpuType) => {
+    if (available.length === 0) return "";
+
+    const preferredH264 = preferredGpuType
+      ? available.find(enc => encoderMatchesGpuType(enc, preferredGpuType) && enc.codec === "h264")
+      : undefined;
+    if (preferredH264) return preferredH264.name;
+
+    const preferredGpu = preferredGpuType
+      ? available.find(enc => encoderMatchesGpuType(enc, preferredGpuType))
+      : undefined;
+    if (preferredGpu) return preferredGpu.name;
+
+    const libx264 = available.find(enc => enc.name === "libx264");
+    if (libx264) return libx264.name;
+
+    const cpu = available.find(enc => isCpuLikeEncoder(enc));
+    if (cpu) return cpu.name;
+
+    return available[0].name;
+  };
+
+  const resolvePreferredGpuType = (preference: string, info: GpuInfo | null): GpuType | null => {
+    if (!info) return null;
+    if (preference === "auto") return info.gpu_type !== "None" ? info.gpu_type : null;
+    if (preference === "cpu") return null;
+
+    const selectedAdapter = info.adapters.find(adapter => adapter.id === preference);
+    return selectedAdapter?.gpu_type ?? null;
+  };
+
+  const getFilteredEncoders = (available: Encoder[], info: GpuInfo | null, preference: string): Encoder[] => {
+    if (available.length === 0) return [];
+
+    if (preference === "cpu") {
+      const cpuOnly = available.filter(isCpuLikeEncoder);
+      return cpuOnly.length > 0 ? cpuOnly : available;
+    }
+
+    const preferredGpuType = resolvePreferredGpuType(preference, info);
+    if (!preferredGpuType) {
+      return available;
+    }
+
+    const targetGpuAndCpu = available.filter(
+      enc => isCpuLikeEncoder(enc) || encoderMatchesGpuType(enc, preferredGpuType)
+    );
+
+    return targetGpuAndCpu.length > 0 ? targetGpuAndCpu : available.filter(isCpuLikeEncoder);
+  };
+
+  const getNvencIndexForSelection = (
+    info: GpuInfo | null,
+    preference: string,
+    selectedEncoder: string
+  ): number | undefined => {
+    if (!info || !selectedEncoder.includes("nvenc")) return undefined;
+
+    const nvidiaAdapters = info.adapters.filter(adapter => adapter.gpu_type === "Nvidia");
+    if (nvidiaAdapters.length === 0) return undefined;
+
+    if (preference === "auto") {
+      const autoId = info.primary_adapter_id;
+      if (autoId) {
+        const autoIndex = nvidiaAdapters.findIndex(adapter => adapter.id === autoId);
+        if (autoIndex >= 0) {
+          return autoIndex;
+        }
+      }
+      return 0;
+    }
+    if (preference === "cpu") return undefined;
+
+    const selected = nvidiaAdapters.findIndex(adapter => adapter.id === preference);
+    if (selected < 0) return undefined;
+    return selected;
   };
 
   const getFileName = (path: string) => {
@@ -180,6 +316,32 @@ export default function App() {
     );
     return (keywordLine || reversed[0] || "").trim() || null;
   };
+
+  const gpuPreferenceOptions = useMemo<GpuPreferenceOption[]>(() => {
+    const options: GpuPreferenceOption[] = [];
+    const primaryName = gpuInfo?.name || "Detected device";
+    options.push({ value: "auto", label: `Auto (${primaryName})` });
+    options.push({ value: "cpu", label: "CPU only (software)" });
+
+    if (gpuInfo) {
+      for (const adapter of gpuInfo.adapters) {
+        const vendor =
+          adapter.gpu_type === "Nvidia"
+            ? "NVIDIA"
+            : adapter.gpu_type === "Amd"
+            ? "AMD"
+            : adapter.gpu_type === "Intel"
+            ? "Intel"
+            : "GPU";
+        options.push({
+          value: adapter.id,
+          label: `${vendor} - ${adapter.name}`,
+        });
+      }
+    }
+
+    return options;
+  }, [gpuInfo]);
 
   const pollProgress = async () => {
     const active = conversionsRef.current.filter(
@@ -301,34 +463,68 @@ export default function App() {
   // Load GPU encoders on mount
   useEffect(() => {
     const initializeApp = async () => {
-      try {
-        console.log("Fetching GPU info...");
-        const info = await invoke<GpuInfo>("get_gpu_info");
+      console.log("Fetching CPU and GPU info...");
+      const [cpuResult, gpuResult] = await Promise.allSettled([
+        invoke<CpuInfo>("get_cpu_info"),
+        invoke<GpuInfo>("get_gpu_info"),
+      ]);
+
+      if (cpuResult.status === "fulfilled") {
+        setCpuInfo(cpuResult.value);
+        addLog(`CPU: ${cpuResult.value.name} (${cpuResult.value.logical_cores} logical cores)`);
+      } else {
+        console.error("Failed to get CPU info:", cpuResult.reason);
+        setCpuInfo(null);
+        addLog(`CPU detection failed: ${String(cpuResult.reason)}`);
+      }
+
+      if (gpuResult.status === "fulfilled") {
+        const info = gpuResult.value;
         console.log("GPU info received:", info);
         console.log("Available encoders:", info.available_encoders);
 
-        setEncoders(info.available_encoders);
-        if (info.name && !isVirtualGpu(info.name)) {
-          setGpuName(info.name);
-        } else {
-          setGpuName("");
-        }
+        setGpuInfo(info);
+        setGpuName(info.name || "");
+        setAllEncoders(info.available_encoders);
+        setGpuPreference("auto");
 
-        // Prefer CPU encoder by default for reliability
-        const cpuEncoder = info.available_encoders.find(e => e.encoder_type === "Cpu");
-        if (cpuEncoder) {
-          setEncoder(cpuEncoder.name);
-        } else if (info.available_encoders.length > 0) {
-          setEncoder(info.available_encoders[0].name);
+        if (info.adapters.length === 0) {
+          addLog("GPU: no physical adapters detected");
+        } else {
+          addLog(`GPU adapters detected: ${info.adapters.length}`);
+          for (const adapter of info.adapters) {
+            const primarySuffix =
+              info.primary_adapter_id === adapter.id ? " [primary]" : "";
+            addLog(
+              `GPU ${adapter.id}: ${adapter.name} (${getGpuTypeLabel(adapter.gpu_type)})${primarySuffix}`
+            );
+          }
         }
-      } catch (err) {
-        console.error("Failed to get GPU info:", err);
-        setGpuName("Detection failed: " + String(err));
+      } else {
+        console.error("Failed to get GPU info:", gpuResult.reason);
+        setGpuName("Detection failed: " + String(gpuResult.reason));
+        setGpuInfo(null);
+        setAllEncoders([]);
+        addLog(`GPU detection failed: ${String(gpuResult.reason)}`);
       }
     };
 
     initializeApp();
   }, []);
+
+  useEffect(() => {
+    const filtered = getFilteredEncoders(allEncoders, gpuInfo, gpuPreference);
+    setEncoders(filtered);
+
+    setEncoder(prev => {
+      if (prev && filtered.some(enc => enc.name === prev)) {
+        return prev;
+      }
+
+      const preferredType = resolvePreferredGpuType(gpuPreference, gpuInfo) ?? undefined;
+      return pickDefaultEncoder(filtered, preferredType);
+    });
+  }, [allEncoders, gpuInfo, gpuPreference]);
 
   useEffect(() => {
     const setDefaultOutputDir = async () => {
@@ -368,6 +564,8 @@ export default function App() {
     if (!encoder) {
       setEncoder(selectedEncoder);
     }
+    const selectedGpuOption = gpuPreferenceOptions.find(option => option.value === gpuPreference);
+    const gpuIndex = getNvencIndexForSelection(gpuInfo, gpuPreference, selectedEncoder);
 
     setErrorMessage(null);
 
@@ -393,6 +591,12 @@ export default function App() {
     const encoderInfo = encoders.find(e => e.name === selectedEncoder);
     if (encoderInfo) {
       addLog(`Encoder: ${encoderInfo.description} (${getEncoderType(encoderInfo)})`);
+    }
+    if (selectedGpuOption) {
+      addLog(`GPU preference: ${selectedGpuOption.label}`);
+    }
+    if (typeof gpuIndex === "number") {
+      addLog(`NVENC GPU index: ${gpuIndex}`);
     }
     if (outputFormat) {
       addLog(`Output format: ${outputFormat.toUpperCase()}`);
@@ -422,6 +626,7 @@ export default function App() {
             inputFile,
             outputFile,
             encoder: selectedEncoder,
+            gpuIndex,
             preset,
             isAdobePreset: false,
           },
@@ -487,17 +692,6 @@ export default function App() {
     setQueue([]);
   };
 
-  const getEncoderType = (enc: Encoder): string => {
-    switch (enc.encoder_type) {
-      case "GpuNvidia": return "NVIDIA GPU";
-      case "GpuAmd": return "AMD GPU";
-      case "GpuIntel": return "Intel GPU";
-      case "Adobe": return "Professional";
-      case "Cpu": return "CPU";
-      default: return "Unknown";
-    }
-  };
-
   return (
     <>
       <StarBackground />
@@ -532,6 +726,24 @@ export default function App() {
                   <i className="ri-folder-open-fill"></i>
                 </button>
               </div>
+            </div>
+
+            <div className="form-group">
+              <label><i className="ri-cpu-fill"></i> Preferred GPU</label>
+              <select
+                className="select"
+                value={gpuPreference}
+                onChange={(e) => setGpuPreference(e.target.value)}
+              >
+                {gpuPreferenceOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <p className="help-text">
+                Auto prefers the best detected GPU; choose CPU for maximum compatibility.
+              </p>
             </div>
 
             <div className="form-group">
@@ -770,8 +982,23 @@ export default function App() {
                 <div className="logs-panel">
                   <div className="log-entry"><i className="ri-checkbox-circle-fill"></i> Application started</div>
                   <div className="log-entry">
+                    <i className="ri-cpu-fill"></i> CPU:{" "}
+                    <span className={cpuInfo ? "status-success" : "status-error"}>
+                      {cpuInfo ? `${cpuInfo.name} (${cpuInfo.logical_cores} logical cores)` : "No CPU info"}
+                    </span>
+                  </div>
+                  <div className="log-entry">
                     <i className="ri-dashboard-fill"></i> GPU detected: <span className={gpuName ? "status-success" : "status-error"}>{gpuName || "No GPU detected"}</span>
                   </div>
+                  {gpuInfo?.adapters.map((adapter) => (
+                    <div key={adapter.id} className="log-entry">
+                      <i className="ri-cpu-line"></i> Adapter {adapter.id}:{" "}
+                      <span className="status-success">
+                        {adapter.name} ({getGpuTypeLabel(adapter.gpu_type)})
+                        {gpuInfo.primary_adapter_id === adapter.id ? " [primary]" : ""}
+                      </span>
+                    </div>
+                  ))}
                   <div className="log-entry"><i className="ri-list-check"></i> Encoders available: {encoders.length}</div>
                   {logs.map((entry, index) => (
                     <div key={`${entry}-${index}`} className="log-entry">{entry}</div>

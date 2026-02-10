@@ -53,6 +53,12 @@ pub struct SupportedFormats {
     pub audio: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CpuInfo {
+    pub name: String,
+    pub logical_cores: usize,
+}
+
 #[derive(Debug, Deserialize)]
 struct StartConversionArgs {
     #[serde(alias = "inputFile")]
@@ -60,6 +66,8 @@ struct StartConversionArgs {
     #[serde(alias = "outputFile")]
     output_file: String,
     encoder: String,
+    #[serde(alias = "gpuIndex")]
+    gpu_index: Option<u32>,
     preset: String,
     #[serde(alias = "isAdobePreset")]
     is_adobe_preset: Option<bool>,
@@ -78,6 +86,71 @@ fn get_default_output_dir() -> Result<String, String> {
         .map_err(|e| format!("Failed to create output directory: {}", e))?;
 
     Ok(target.to_string_lossy().to_string())
+}
+
+async fn detect_cpu_name() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut ps_cmd = Command::new("powershell");
+        ps_cmd.args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name",
+        ]);
+        ps_cmd.creation_flags(CREATE_NO_WINDOW);
+
+        if let Ok(output) = ps_cmd.output().await {
+            if output.status.success() {
+                let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("sh")
+            .args(["-lc", "cat /proc/cpuinfo | grep -m1 'model name' | cut -d: -f2-"])
+            .output()
+            .await
+            .ok()?;
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+            .await
+            .ok()?;
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+
+    None
+}
+
+#[tauri::command]
+async fn get_cpu_info() -> Result<CpuInfo, String> {
+    let logical_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    let name = detect_cpu_name()
+        .await
+        .unwrap_or_else(|| "Unknown CPU".to_string());
+
+    Ok(CpuInfo {
+        name,
+        logical_cores,
+    })
 }
 
 
@@ -273,6 +346,7 @@ async fn start_conversion(
     input_file: Option<String>,
     output_file: Option<String>,
     encoder: Option<String>,
+    gpu_index: Option<u32>,
     preset: Option<String>,
     is_adobe_preset: Option<bool>,
     args: Option<StartConversionArgs>,
@@ -288,6 +362,7 @@ async fn start_conversion(
             input_file: input_file.ok_or_else(|| "Missing input_file".to_string())?,
             output_file: output_file.ok_or_else(|| "Missing output_file".to_string())?,
             encoder: encoder.unwrap_or_else(|| "libx264".to_string()),
+            gpu_index,
             preset: preset.unwrap_or_else(|| "fast".to_string()),
             is_adobe_preset,
         }
@@ -296,6 +371,7 @@ async fn start_conversion(
         input_file,
         output_file,
         encoder,
+        gpu_index,
         preset,
         is_adobe_preset,
     } = resolved;
@@ -338,8 +414,8 @@ async fn start_conversion(
     }
 
     println!(
-        "start_conversion: input='{}' output='{}' encoder='{}' preset='{}' adobe={:?}",
-        input_file, output_file, encoder, preset, is_adobe_preset
+        "start_conversion: input='{}' output='{}' encoder='{}' gpu_index={:?} preset='{}' adobe={:?}",
+        input_file, output_file, encoder, gpu_index, preset, is_adobe_preset
     );
     
     let manager = state.ffmpeg_manager.clone();
@@ -351,6 +427,7 @@ async fn start_conversion(
         output_file,
         ffmpeg_path_str,
         encoder,
+        gpu_index,
         preset,
         is_adobe_preset.unwrap_or(false),
     ).map_err(|e| e.to_string())?;
@@ -528,6 +605,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             check_ffmpeg,
             download_ffmpeg,
+            get_cpu_info,
             get_gpu_info,
             get_available_encoders,
             get_ffmpeg_version,

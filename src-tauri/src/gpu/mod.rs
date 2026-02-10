@@ -13,16 +13,26 @@ pub struct GpuInfo {
     pub detected: bool,
     pub gpu_type: GpuType,
     pub name: String,
+    pub primary_adapter_id: Option<String>,
+    pub adapters: Vec<GpuAdapter>,
     pub available_encoders: Vec<EncoderInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum GpuType {
     Nvidia,
     Intel,
     Amd,
     Unknown,
     None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuAdapter {
+    pub id: String,
+    pub name: String,
+    pub gpu_type: GpuType,
+    pub is_virtual: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,25 +103,174 @@ impl GpuDetector {
         }
     }
 
-    fn pick_physical_gpu(names: &[String]) -> Option<(String, GpuType)> {
-        for name in names {
-            if !Self::is_virtual_adapter(name) {
-                let gpu_type = Self::classify_gpu_name(name);
-                return Some((name.clone(), gpu_type));
-            }
-        }
-        None
+    fn is_likely_integrated(name: &str) -> bool {
+        let name_upper = name.to_uppercase();
+        name_upper.contains("UHD")
+            || name_upper.contains("HD GRAPHICS")
+            || name_upper.contains("IRIS")
+            || name_upper.contains("IRIS XE")
+            || name_upper.contains("RADEON GRAPHICS")
+            || name_upper.contains("INTEGRATED")
+            || name_upper.contains("APU")
     }
 
-    fn filter_encoders_by_gpu(encoders: Vec<EncoderInfo>, gpu_type: GpuType) -> Vec<EncoderInfo> {
-        let allow = match gpu_type {
-            GpuType::Nvidia => |t: &EncoderType| matches!(t, EncoderType::Cpu | EncoderType::Adobe | EncoderType::GpuNvidia),
-            GpuType::Amd => |t: &EncoderType| matches!(t, EncoderType::Cpu | EncoderType::Adobe | EncoderType::GpuAmd),
-            GpuType::Intel => |t: &EncoderType| matches!(t, EncoderType::Cpu | EncoderType::Adobe | EncoderType::GpuIntel),
-            GpuType::Unknown | GpuType::None => |t: &EncoderType| matches!(t, EncoderType::Cpu | EncoderType::Adobe),
+    fn gpu_priority(name: &str, gpu_type: GpuType) -> i32 {
+        let name_upper = name.to_uppercase();
+        let mut score = match gpu_type {
+            GpuType::Nvidia => 300,
+            GpuType::Amd => 250,
+            GpuType::Intel => 180,
+            GpuType::Unknown => 100,
+            GpuType::None => 0,
         };
 
-        encoders.into_iter().filter(|e| allow(&e.encoder_type)).collect()
+        if name_upper.contains("RTX") {
+            score += 60;
+        } else if name_upper.contains("GTX") {
+            score += 40;
+        } else if name_upper.contains("ARC") {
+            score += 30;
+        } else if name_upper.contains("RX ") || name_upper.contains("RADEON RX") {
+            score += 35;
+        }
+
+        if Self::is_likely_integrated(name) {
+            score -= 55;
+        }
+
+        score
+    }
+
+    fn cleaned_non_empty_names(names: Vec<String>) -> Vec<String> {
+        names
+            .into_iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect()
+    }
+
+    fn build_adapters(names: Vec<String>) -> Vec<GpuAdapter> {
+        let cleaned_names = Self::cleaned_non_empty_names(names);
+
+        cleaned_names
+            .into_iter()
+            .enumerate()
+            .filter_map(|name| {
+                let (index, name) = name;
+                if Self::is_virtual_adapter(&name) {
+                    return None;
+                }
+
+                Some(GpuAdapter {
+                    id: format!("gpu-{}", index),
+                    gpu_type: Self::classify_gpu_name(&name),
+                    is_virtual: false,
+                    name,
+                })
+            })
+            .collect()
+    }
+
+    fn pick_primary_adapter(adapters: &[GpuAdapter]) -> Option<&GpuAdapter> {
+        adapters.iter().max_by(|a, b| {
+            let left = Self::gpu_priority(&a.name, a.gpu_type);
+            let right = Self::gpu_priority(&b.name, b.gpu_type);
+            left.cmp(&right)
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn collect_gpu_names() -> Vec<String> {
+        let mut wmic_names = Vec::new();
+        let mut wmic_cmd = Command::new("wmic");
+        wmic_cmd.args(["path", "win32_videocontroller", "get", "name", "/format:csv"]);
+        wmic_cmd.creation_flags(CREATE_NO_WINDOW);
+
+        if let Ok(output) = wmic_cmd.output().await {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with("Node") {
+                    continue;
+                }
+
+                // CSV format: Node,DeviceID,Name
+                let parts: Vec<&str> = line.split(',').collect();
+                if parts.len() >= 3 {
+                    wmic_names.push(parts[2].trim().to_string());
+                }
+            }
+        }
+
+        if !Self::cleaned_non_empty_names(wmic_names.clone()).is_empty() {
+            return wmic_names;
+        }
+
+        let mut ps_names = Vec::new();
+        let mut ps_cmd = Command::new("powershell");
+        ps_cmd.args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+        ]);
+        ps_cmd.creation_flags(CREATE_NO_WINDOW);
+
+        if let Ok(output) = ps_cmd.output().await {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                ps_names.push(line.trim().to_string());
+            }
+        }
+
+        ps_names
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn collect_gpu_names() -> Vec<String> {
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-lc",
+            "lspci | grep -Ei 'vga|3d|display' | sed -E 's/^.*: //'",
+        ]);
+
+        match cmd.output().await {
+            Ok(output) => String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|line| line.trim().to_string())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn collect_gpu_names() -> Vec<String> {
+        let mut cmd = Command::new("system_profiler");
+        cmd.args(["SPDisplaysDataType", "-json"]);
+
+        let mut names = Vec::new();
+        if let Ok(output) = cmd.output().await {
+            if output.status.success() {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                    if let Some(items) = json
+                        .get("SPDisplaysDataType")
+                        .and_then(|v| v.as_array())
+                    {
+                        for item in items {
+                            if let Some(name) = item.get("sppci_model").and_then(|v| v.as_str()) {
+                                names.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        names
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    async fn collect_gpu_names() -> Vec<String> {
+        Vec::new()
     }
 
     /// Detect GPU information and available encoders
@@ -121,92 +280,22 @@ impl GpuDetector {
 
     /// Detect GPU information with specific ffmpeg path
     pub async fn detect_with_ffmpeg(ffmpeg_path: Option<&str>) -> Result<GpuInfo, Box<dyn std::error::Error>> {
-        // Try to detect GPU via wmic
-        let mut wmic_cmd = Command::new("wmic");
-        wmic_cmd.args(&["path", "win32_videocontroller", "get", "name", "/format:csv"]);
-
-        #[cfg(target_os = "windows")]
-        wmic_cmd.creation_flags(CREATE_NO_WINDOW);
-
-        let mut gpu_name = String::new();
-        let mut gpu_type = GpuType::None;
-
-        match wmic_cmd.output().await {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let mut names: Vec<String> = Vec::new();
-
-                for line in stdout.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with("Node") {
-                        continue;
-                    }
-
-                    // CSV format: Node,DeviceID,Name
-                    let parts: Vec<&str> = line.split(',').collect();
-                    if parts.len() >= 3 {
-                        let name = parts[2].trim();
-                        if !name.is_empty() {
-                            names.push(name.to_string());
-                        }
-                    }
-                }
-
-                if let Some((name, detected_type)) = Self::pick_physical_gpu(&names) {
-                    gpu_name = name;
-                    gpu_type = detected_type;
-                }
-            }
-            Err(e) => {
-                println!("  GPU detection skipped (wmic unavailable): {:?}", e);
-            }
-        }
-
-        if gpu_name.is_empty() {
-            let mut ps_cmd = Command::new("powershell");
-            ps_cmd.args([
-                "-NoProfile",
-                "-Command",
-                "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
-            ]);
-            #[cfg(target_os = "windows")]
-            ps_cmd.creation_flags(CREATE_NO_WINDOW);
-
-            match ps_cmd.output().await {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let names: Vec<String> = stdout
-                        .lines()
-                        .map(|line| line.trim())
-                        .filter(|line| !line.is_empty())
-                        .map(|line| line.to_string())
-                        .collect();
-
-                    if let Some((name, detected_type)) = Self::pick_physical_gpu(&names) {
-                        gpu_name = name;
-                        gpu_type = detected_type;
-                    } else {
-                        println!("  PowerShell GPU query returned no physical adapter.");
-                    }
-                }
-                Err(e) => {
-                    println!("  GPU detection skipped (PowerShell unavailable): {:?}", e);
-                }
-            }
-        }
-
-        if gpu_type == GpuType::None && !gpu_name.is_empty() {
-            gpu_type = GpuType::Unknown;
-        }
+        let names = Self::collect_gpu_names().await;
+        let adapters = Self::build_adapters(names);
+        let primary = Self::pick_primary_adapter(&adapters);
+        let gpu_name = primary.map(|a| a.name.clone()).unwrap_or_default();
+        let primary_adapter_id = primary.map(|a| a.id.clone());
+        let gpu_type = primary.map(|a| a.gpu_type).unwrap_or(GpuType::None);
 
         // Get available encoders by running ffmpeg -encoders
         let available_encoders = Self::get_available_encoders(ffmpeg_path).await?;
-        let available_encoders = Self::filter_encoders_by_gpu(available_encoders, gpu_type.clone());
 
         Ok(GpuInfo {
             detected: !matches!(gpu_type, GpuType::None),
             gpu_type,
             name: gpu_name,
+            primary_adapter_id,
+            adapters,
             available_encoders,
         })
     }
@@ -454,42 +543,41 @@ impl GpuDetector {
 mod tests {
     use super::*;
 
-    fn make_encoder(name: &str, encoder_type: EncoderType) -> EncoderInfo {
-        EncoderInfo {
-            name: name.to_string(),
-            description: name.to_string(),
-            codec: "h264".to_string(),
-            encoder_type,
-        }
+    #[test]
+    fn picks_discrete_gpu_above_integrated() {
+        let names = vec![
+            "Intel(R) UHD Graphics".to_string(),
+            "NVIDIA GeForce GTX 1660 Ti".to_string(),
+        ];
+
+        let adapters = GpuDetector::build_adapters(names);
+        let primary = GpuDetector::pick_primary_adapter(&adapters);
+        assert_eq!(primary.map(|a| a.gpu_type), Some(GpuType::Nvidia));
     }
 
     #[test]
-    fn filters_encoders_by_gpu_type() {
-        let encoders = vec![
-            make_encoder("libx264", EncoderType::Cpu),
-            make_encoder("prores_ks", EncoderType::Adobe),
-            make_encoder("h264_nvenc", EncoderType::GpuNvidia),
-            make_encoder("h264_amf", EncoderType::GpuAmd),
-            make_encoder("h264_qsv", EncoderType::GpuIntel),
+    fn filters_virtual_adapters() {
+        let names = vec![
+            "Microsoft Basic Display Adapter".to_string(),
+            "NVIDIA GeForce RTX 4060".to_string(),
         ];
 
-        let nvidia = GpuDetector::filter_encoders_by_gpu(encoders.clone(), GpuType::Nvidia);
-        assert!(nvidia.iter().any(|e| matches!(e.encoder_type, EncoderType::GpuNvidia)));
-        assert!(!nvidia.iter().any(|e| matches!(e.encoder_type, EncoderType::GpuAmd)));
-        assert!(!nvidia.iter().any(|e| matches!(e.encoder_type, EncoderType::GpuIntel)));
+        let adapters = GpuDetector::build_adapters(names);
+        assert_eq!(adapters.len(), 1);
+        assert_eq!(adapters[0].gpu_type, GpuType::Nvidia);
+    }
 
-        let amd = GpuDetector::filter_encoders_by_gpu(encoders.clone(), GpuType::Amd);
-        assert!(amd.iter().any(|e| matches!(e.encoder_type, EncoderType::GpuAmd)));
-        assert!(!amd.iter().any(|e| matches!(e.encoder_type, EncoderType::GpuNvidia)));
-        assert!(!amd.iter().any(|e| matches!(e.encoder_type, EncoderType::GpuIntel)));
+    #[test]
+    fn preserves_identical_model_entries() {
+        let names = vec![
+            "NVIDIA GeForce RTX 4090".to_string(),
+            "NVIDIA GeForce RTX 4090".to_string(),
+        ];
 
-        let intel = GpuDetector::filter_encoders_by_gpu(encoders.clone(), GpuType::Intel);
-        assert!(intel.iter().any(|e| matches!(e.encoder_type, EncoderType::GpuIntel)));
-        assert!(!intel.iter().any(|e| matches!(e.encoder_type, EncoderType::GpuNvidia)));
-        assert!(!intel.iter().any(|e| matches!(e.encoder_type, EncoderType::GpuAmd)));
-
-        let unknown = GpuDetector::filter_encoders_by_gpu(encoders, GpuType::Unknown);
-        assert!(unknown.iter().all(|e| matches!(e.encoder_type, EncoderType::Cpu | EncoderType::Adobe)));
+        let adapters = GpuDetector::build_adapters(names);
+        assert_eq!(adapters.len(), 2);
+        assert_eq!(adapters[0].id, "gpu-0");
+        assert_eq!(adapters[1].id, "gpu-1");
     }
 }
 
