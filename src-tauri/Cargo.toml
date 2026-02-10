@@ -1,6 +1,6 @@
 [package]
 name = "dreamcodec"
-version = "2.2.4"
+version = "2.2.5"
 description = "GPU-accelerated video converter built with Tauri"
 authors = ["Thornvald"]
 edition = "2021"

@@ -72,23 +72,132 @@ interface ConversionProgress {
 }
 
 const SUPPORTED_INPUT_EXTENSIONS = new Set(["mkv", "mp4", "avi", "mov", "wmv", "flv", "webm"]);
+const PREFERENCE_CACHE_KEY = "dreamcodec.preferences.v1";
+const HARDWARE_CACHE_KEY = "dreamcodec.hardware.v1";
+const HARDWARE_CACHE_VERSION = 1;
+
+interface PreferenceCache {
+  encoder: string;
+  gpuPreference: string;
+}
+
+interface HardwareCache {
+  version: number;
+  savedAt: number;
+  cpuInfo: CpuInfo | null;
+  gpuInfo: GpuInfo;
+}
+
+const readPreferenceCache = (): PreferenceCache => {
+  if (typeof window === "undefined") {
+    return { encoder: "", gpuPreference: "auto" };
+  }
+
+  try {
+    const raw = window.localStorage.getItem(PREFERENCE_CACHE_KEY);
+    if (!raw) return { encoder: "", gpuPreference: "auto" };
+
+    const parsed = JSON.parse(raw) as Partial<PreferenceCache>;
+    return {
+      encoder: typeof parsed.encoder === "string" ? parsed.encoder : "",
+      gpuPreference:
+        typeof parsed.gpuPreference === "string" && parsed.gpuPreference.length > 0
+          ? parsed.gpuPreference
+          : "auto",
+    };
+  } catch {
+    return { encoder: "", gpuPreference: "auto" };
+  }
+};
+
+const writePreferenceCache = (update: Partial<PreferenceCache>) => {
+  if (typeof window === "undefined") return;
+
+  const current = readPreferenceCache();
+  const next: PreferenceCache = {
+    encoder: update.encoder ?? current.encoder,
+    gpuPreference: update.gpuPreference ?? current.gpuPreference,
+  };
+
+  try {
+    window.localStorage.setItem(PREFERENCE_CACHE_KEY, JSON.stringify(next));
+  } catch {
+    // Ignore storage write failures.
+  }
+};
+
+const isGpuInfoLike = (value: unknown): value is GpuInfo => {
+  if (!value || typeof value !== "object") return false;
+  const maybe = value as Partial<GpuInfo>;
+  return Array.isArray(maybe.adapters) && Array.isArray(maybe.available_encoders);
+};
+
+const readHardwareCache = (): HardwareCache | null => {
+  if (typeof window === "undefined") return null;
+
+  try {
+    const raw = window.localStorage.getItem(HARDWARE_CACHE_KEY);
+    if (!raw) return null;
+
+    const parsed = JSON.parse(raw) as Partial<HardwareCache>;
+    if (parsed.version !== HARDWARE_CACHE_VERSION) return null;
+    if (typeof parsed.savedAt !== "number") return null;
+    if (!isGpuInfoLike(parsed.gpuInfo)) return null;
+
+    const cpuInfo =
+      parsed.cpuInfo &&
+      typeof parsed.cpuInfo === "object" &&
+      typeof (parsed.cpuInfo as Partial<CpuInfo>).name === "string" &&
+      typeof (parsed.cpuInfo as Partial<CpuInfo>).logical_cores === "number"
+        ? (parsed.cpuInfo as CpuInfo)
+        : null;
+
+    return {
+      version: HARDWARE_CACHE_VERSION,
+      savedAt: parsed.savedAt,
+      cpuInfo,
+      gpuInfo: parsed.gpuInfo,
+    };
+  } catch {
+    return null;
+  }
+};
+
+const writeHardwareCache = (cpuInfo: CpuInfo | null, gpuInfo: GpuInfo) => {
+  if (typeof window === "undefined") return;
+
+  const payload: HardwareCache = {
+    version: HARDWARE_CACHE_VERSION,
+    savedAt: Date.now(),
+    cpuInfo,
+    gpuInfo,
+  };
+
+  try {
+    window.localStorage.setItem(HARDWARE_CACHE_KEY, JSON.stringify(payload));
+  } catch {
+    // Ignore storage write failures.
+  }
+};
 
 export default function App() {
   const [activeTab, setActiveTab] = useState("queue");
   const [outputDir, setOutputDir] = useState("");
-  const [encoder, setEncoder] = useState("");
+  const [encoder, setEncoder] = useState(() => readPreferenceCache().encoder);
   const [preset, setPreset] = useState("fast");
   const [outputFormat, setOutputFormat] = useState("mp4");
   const [queue, setQueue] = useState<QueueFile[]>([]);
   const [encoders, setEncoders] = useState<Encoder[]>([]);
   const [allEncoders, setAllEncoders] = useState<Encoder[]>([]);
   const [gpuInfo, setGpuInfo] = useState<GpuInfo | null>(null);
-  const [gpuPreference, setGpuPreference] = useState("auto");
+  const [gpuPreference, setGpuPreference] = useState(() => readPreferenceCache().gpuPreference);
   const [cpuInfo, setCpuInfo] = useState<CpuInfo | null>(null);
   const [gpuName, setGpuName] = useState("");
   const [conversions, setConversions] = useState<ConversionItem[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isHardwareInitializing, setIsHardwareInitializing] = useState(true);
+  const [hardwareInitError, setHardwareInitError] = useState<string | null>(null);
   const [isDragOverlayVisible, setIsDragOverlayVisible] = useState(false);
   const [draggedFileCount, setDraggedFileCount] = useState(0);
   const conversionsRef = useRef<ConversionItem[]>([]);
@@ -97,6 +206,14 @@ export default function App() {
   useEffect(() => {
     conversionsRef.current = conversions;
   }, [conversions]);
+
+  useEffect(() => {
+    writePreferenceCache({ encoder });
+  }, [encoder]);
+
+  useEffect(() => {
+    writePreferenceCache({ gpuPreference });
+  }, [gpuPreference]);
 
   const addLog = (message: string) => {
     const timestamp = new Date().toLocaleTimeString();
@@ -502,30 +619,54 @@ export default function App() {
   // Load GPU encoders on mount
   useEffect(() => {
     const initializeApp = async () => {
-      console.log("Fetching CPU and GPU info...");
-      const [cpuResult, gpuResult] = await Promise.allSettled([
-        invoke<CpuInfo>("get_cpu_info"),
-        invoke<GpuInfo>("get_gpu_info"),
-      ]);
+      const cached = readHardwareCache();
 
-      if (cpuResult.status === "fulfilled") {
-        setCpuInfo(cpuResult.value);
-        addLog(`CPU: ${cpuResult.value.name} (${cpuResult.value.logical_cores} logical cores)`);
+      if (cached) {
+        setCpuInfo(cached.cpuInfo);
+        setGpuInfo(cached.gpuInfo);
+        setGpuName(cached.gpuInfo.name || "");
+        setAllEncoders(cached.gpuInfo.available_encoders);
+        setIsHardwareInitializing(false);
+        setHardwareInitError(null);
+        addLog("Loaded cached hardware profile. Refreshing in background...");
       } else {
-        console.error("Failed to get CPU info:", cpuResult.reason);
-        setCpuInfo(null);
-        addLog(`CPU detection failed: ${String(cpuResult.reason)}`);
+        setIsHardwareInitializing(true);
+        addLog("Detecting CPU, GPUs, and encoders...");
       }
 
-      if (gpuResult.status === "fulfilled") {
-        const info = gpuResult.value;
+      setHardwareInitError(null);
+      console.log("Fetching CPU and GPU info...");
+
+      let latestCpuInfo = cached?.cpuInfo ?? null;
+      let latestGpuInfo = cached?.gpuInfo ?? null;
+
+      const cpuTask = invoke<CpuInfo>("get_cpu_info")
+        .then((info) => {
+          latestCpuInfo = info;
+          setCpuInfo(info);
+          addLog(`CPU: ${info.name} (${info.logical_cores} logical cores)`);
+          if (latestGpuInfo) {
+            writeHardwareCache(info, latestGpuInfo);
+          }
+        })
+        .catch((err) => {
+          console.error("Failed to get CPU info:", err);
+          if (!cached) {
+            setCpuInfo(null);
+          }
+          addLog(`CPU detection failed: ${String(err)}`);
+        });
+
+      try {
+        const info = await invoke<GpuInfo>("get_gpu_info");
+        latestGpuInfo = info;
         console.log("GPU info received:", info);
         console.log("Available encoders:", info.available_encoders);
 
         setGpuInfo(info);
         setGpuName(info.name || "");
         setAllEncoders(info.available_encoders);
-        setGpuPreference("auto");
+        writeHardwareCache(latestCpuInfo, info);
 
         if (info.adapters.length === 0) {
           addLog("GPU: no physical adapters detected");
@@ -539,17 +680,38 @@ export default function App() {
             );
           }
         }
-      } else {
-        console.error("Failed to get GPU info:", gpuResult.reason);
-        setGpuName("Detection failed: " + String(gpuResult.reason));
-        setGpuInfo(null);
-        setAllEncoders([]);
-        addLog(`GPU detection failed: ${String(gpuResult.reason)}`);
+        if (info.available_encoders.length === 0) {
+          setHardwareInitError("No encoders were detected.");
+        }
+      } catch (err) {
+        console.error("Failed to get GPU info:", err);
+        if (!cached) {
+          setGpuName("Detection failed: " + String(err));
+          setGpuInfo(null);
+          setAllEncoders([]);
+          setHardwareInitError(String(err));
+        }
+        addLog(`GPU detection failed: ${String(err)}`);
+      } finally {
+        setIsHardwareInitializing(false);
+        addLog("Hardware detection completed.");
       }
+
+      void cpuTask;
     };
 
-    initializeApp();
+    void initializeApp();
   }, []);
+
+  useEffect(() => {
+    if (gpuPreference === "auto" || gpuPreference === "cpu") return;
+    if (!gpuInfo) return;
+
+    const exists = gpuInfo.adapters.some((adapter) => adapter.id === gpuPreference);
+    if (!exists) {
+      setGpuPreference("auto");
+    }
+  }, [gpuInfo, gpuPreference]);
 
   useEffect(() => {
     const filtered = getFilteredEncoders(allEncoders, gpuInfo, gpuPreference);
@@ -647,6 +809,11 @@ export default function App() {
   };
 
   const handleStartConversion = async () => {
+    if (isHardwareInitializing) {
+      addLog("Please wait for hardware detection to finish.");
+      return;
+    }
+
     if (queue.length === 0) {
       addLog("Queue is empty.");
       return;
@@ -805,7 +972,7 @@ export default function App() {
           </div>
           <div className="gpu-badge">
             <i className="ri-dashboard-fill"></i>
-            <span>{gpuName || "CPU (software)"}</span>
+            <span>{isHardwareInitializing ? "Detecting hardware..." : (gpuName || "CPU (software)")}</span>
           </div>
         </header>
 
@@ -835,6 +1002,7 @@ export default function App() {
                 className="select"
                 value={gpuPreference}
                 onChange={(e) => setGpuPreference(e.target.value)}
+                disabled={isHardwareInitializing}
               >
                 {gpuPreferenceOptions.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -843,13 +1011,20 @@ export default function App() {
                 ))}
               </select>
               <p className="help-text">
-                Auto prefers the best detected GPU; choose CPU for maximum compatibility.
+                {isHardwareInitializing
+                  ? "Detecting adapters..."
+                  : "Auto prefers the best detected GPU; choose CPU for maximum compatibility."}
               </p>
             </div>
 
             <div className="form-group">
               <label><i className="ri-movie-2-fill"></i> Video Encoder</label>
-              <select className="select" value={encoder} onChange={(e) => setEncoder(e.target.value)}>
+              <select
+                className="select"
+                value={encoder}
+                onChange={(e) => setEncoder(e.target.value)}
+                disabled={isHardwareInitializing}
+              >
                 <option value="">Select encoder...</option>
                 {encoders.map((enc) => (
                   <option key={enc.name} value={enc.name}>
@@ -857,9 +1032,16 @@ export default function App() {
                   </option>
                 ))}
               </select>
-              {encoders.length === 0 && (
+              {isHardwareInitializing ? (
+                <p className="help-text">
+                  <i className="ri-loader-4-line icon-spin"></i> Detecting available encoders...
+                </p>
+              ) : encoders.length === 0 && (
                 <p className="help-text" style={{ color: "rgba(239, 68, 68, 0.7)" }}>
-                  <i className="ri-error-warning-fill"></i> No encoders detected. FFmpeg may not be installed.
+                  <i className="ri-error-warning-fill"></i>{" "}
+                  {hardwareInitError
+                    ? `No encoders detected (${hardwareInitError}).`
+                    : "No encoders detected. FFmpeg may not be installed."}
                 </p>
               )}
             </div>
@@ -944,7 +1126,7 @@ export default function App() {
                       <button
                         className="button button-start"
                         onClick={handleStartConversion}
-                        disabled={queue.length === 0}
+                        disabled={queue.length === 0 || isHardwareInitializing}
                       >
                         <i className="ri-play-circle-fill"></i> Start Conversion
                       </button>
@@ -1111,7 +1293,7 @@ export default function App() {
         </div>
 
         <footer className="footer">
-          <i className="ri-video-fill"></i> Dreamcodec v2.2.4 • Made by Thornvald
+          <i className="ri-video-fill"></i> Dreamcodec v2.2.5 • Made by Thornvald
         </footer>
       </div>
     </>

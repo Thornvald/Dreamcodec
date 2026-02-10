@@ -2,7 +2,7 @@
 
 A modern desktop application for converting video and audio files with GPU hardware acceleration and Adobe/After Effects compatibility. Built with Tauri 2, React + TypeScript, and Rust.
 
-![Version](https://img.shields.io/badge/version-2.2.4-blue.svg)
+![Version](https://img.shields.io/badge/version-2.2.5-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
 

@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.5] - 2026-02-10
+
+### Fixed
+- Encoder/GPU selection now becomes ready faster at startup by applying GPU/encoder detection results immediately (without waiting for CPU probe).
+
+### Improved
+- Added startup hardware profile caching so previous valid GPU adapters and encoders appear instantly while live detection refreshes in the background.
+- Preserved selected GPU preference and encoder across app restarts for quicker startup selection stability.
+
 ## [2.2.4] - 2026-02-10
 
 ### Added
