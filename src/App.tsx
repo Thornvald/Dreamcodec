@@ -55,6 +55,13 @@ interface QueueFile {
 
 type ConversionStatus = "pending" | "converting" | "completed" | "failed" | "cancelled";
 
+interface ConversionParams {
+  encoder: string;
+  gpuIndex: number | undefined;
+  cpuThreads: number | undefined;
+  preset: string;
+}
+
 interface ConversionItem {
   id: string;
   inputFile: string;
@@ -62,6 +69,7 @@ interface ConversionItem {
   status: ConversionStatus;
   progress: number;
   failureMessage?: string | null;
+  params?: ConversionParams;
 }
 
 interface ConversionProgress {
@@ -79,6 +87,8 @@ const HARDWARE_CACHE_VERSION = 1;
 interface PreferenceCache {
   encoder: string;
   gpuPreference: string;
+  cpuLimit: number;
+  maxConcurrent: number;
 }
 
 interface HardwareCache {
@@ -89,13 +99,12 @@ interface HardwareCache {
 }
 
 const readPreferenceCache = (): PreferenceCache => {
-  if (typeof window === "undefined") {
-    return { encoder: "", gpuPreference: "auto" };
-  }
+  const defaults: PreferenceCache = { encoder: "", gpuPreference: "auto", cpuLimit: 100, maxConcurrent: 3 };
+  if (typeof window === "undefined") return defaults;
 
   try {
     const raw = window.localStorage.getItem(PREFERENCE_CACHE_KEY);
-    if (!raw) return { encoder: "", gpuPreference: "auto" };
+    if (!raw) return defaults;
 
     const parsed = JSON.parse(raw) as Partial<PreferenceCache>;
     return {
@@ -104,9 +113,15 @@ const readPreferenceCache = (): PreferenceCache => {
         typeof parsed.gpuPreference === "string" && parsed.gpuPreference.length > 0
           ? parsed.gpuPreference
           : "auto",
+      cpuLimit: typeof parsed.cpuLimit === "number" && [25, 50, 75, 100].includes(parsed.cpuLimit)
+        ? parsed.cpuLimit
+        : 100,
+      maxConcurrent: typeof parsed.maxConcurrent === "number" && parsed.maxConcurrent >= 1 && parsed.maxConcurrent <= 5
+        ? parsed.maxConcurrent
+        : 3,
     };
   } catch {
-    return { encoder: "", gpuPreference: "auto" };
+    return defaults;
   }
 };
 
@@ -117,6 +132,8 @@ const writePreferenceCache = (update: Partial<PreferenceCache>) => {
   const next: PreferenceCache = {
     encoder: update.encoder ?? current.encoder,
     gpuPreference: update.gpuPreference ?? current.gpuPreference,
+    cpuLimit: update.cpuLimit ?? current.cpuLimit,
+    maxConcurrent: update.maxConcurrent ?? current.maxConcurrent,
   };
 
   try {
@@ -191,6 +208,8 @@ export default function App() {
   const [allEncoders, setAllEncoders] = useState<Encoder[]>([]);
   const [gpuInfo, setGpuInfo] = useState<GpuInfo | null>(null);
   const [gpuPreference, setGpuPreference] = useState(() => readPreferenceCache().gpuPreference);
+  const [cpuLimit, setCpuLimit] = useState(() => readPreferenceCache().cpuLimit);
+  const [maxConcurrent, setMaxConcurrent] = useState(() => readPreferenceCache().maxConcurrent);
   const [cpuInfo, setCpuInfo] = useState<CpuInfo | null>(null);
   const [gpuName, setGpuName] = useState("");
   const [conversions, setConversions] = useState<ConversionItem[]>([]);
@@ -207,6 +226,15 @@ export default function App() {
     conversionsRef.current = conversions;
   }, [conversions]);
 
+  // Auto-start next pending conversion when a slot opens up
+  useEffect(() => {
+    const activeCount = conversions.filter(c => c.status === "converting").length;
+    const hasPending = conversions.some(c => c.status === "pending" && c.params);
+    if (hasPending && activeCount < maxConcurrent) {
+      void startNextPending();
+    }
+  }, [conversions, maxConcurrent]);
+
   useEffect(() => {
     writePreferenceCache({ encoder });
   }, [encoder]);
@@ -214,6 +242,14 @@ export default function App() {
   useEffect(() => {
     writePreferenceCache({ gpuPreference });
   }, [gpuPreference]);
+
+  useEffect(() => {
+    writePreferenceCache({ cpuLimit });
+  }, [cpuLimit]);
+
+  useEffect(() => {
+    writePreferenceCache({ maxConcurrent });
+  }, [maxConcurrent]);
 
   const addLog = (message: string) => {
     const timestamp = new Date().toLocaleTimeString();
@@ -409,12 +445,6 @@ export default function App() {
 
       return merged;
     });
-  };
-
-  const getFileDir = (path: string) => {
-    const parts = path.split(/[/\\]/);
-    parts.pop();
-    return parts.join("\\");
   };
 
   const getFileExt = (name: string) => {
@@ -808,6 +838,48 @@ export default function App() {
     }
   };
 
+  const startPendingConversion = async (item: ConversionItem): Promise<string | null> => {
+    if (!item.params) return null;
+    try {
+      const taskId = await invoke<string>("start_conversion", {
+        args: {
+          inputFile: item.inputFile,
+          outputFile: item.outputFile,
+          encoder: item.params.encoder,
+          gpuIndex: item.params.gpuIndex,
+          cpuThreads: item.params.cpuThreads,
+          preset: item.params.preset,
+          isAdobePreset: false,
+        },
+      });
+      return taskId;
+    } catch (err) {
+      addLog(`Failed to start: ${getFileName(item.inputFile)} (${String(err)})`);
+      return null;
+    }
+  };
+
+  const startNextPending = async () => {
+    const current = conversionsRef.current;
+    const activeCount = current.filter(c => c.status === "converting").length;
+    const pending = current.filter(c => c.status === "pending" && c.params);
+    const slotsAvailable = maxConcurrent - activeCount;
+
+    for (let i = 0; i < Math.min(slotsAvailable, pending.length); i++) {
+      const item = pending[i];
+      const taskId = await startPendingConversion(item);
+      if (taskId) {
+        setConversions(prev => prev.map(c =>
+          c.id === item.id ? { ...c, id: taskId, status: "converting" as ConversionStatus } : c
+        ));
+      } else {
+        setConversions(prev => prev.map(c =>
+          c.id === item.id ? { ...c, status: "failed" as ConversionStatus, failureMessage: "Failed to start" } : c
+        ));
+      }
+    }
+  };
+
   const handleStartConversion = async () => {
     if (isHardwareInitializing) {
       addLog("Please wait for hardware detection to finish.");
@@ -825,6 +897,9 @@ export default function App() {
     }
     const selectedGpuOption = gpuPreferenceOptions.find(option => option.value === gpuPreference);
     const gpuIndex = getNvencIndexForSelection(gpuInfo, gpuPreference, selectedEncoder);
+    const cpuThreads = cpuLimit < 100 && cpuInfo
+      ? Math.max(1, Math.round(cpuInfo.logical_cores * cpuLimit / 100))
+      : undefined;
 
     setErrorMessage(null);
 
@@ -855,67 +930,78 @@ export default function App() {
       addLog(`GPU preference: ${selectedGpuOption.label}`);
     }
     if (typeof gpuIndex === "number") {
-      addLog(`NVENC GPU index: ${gpuIndex}`);
+      const nvidiaAdapters = gpuInfo?.adapters.filter(a => a.gpu_type === "Nvidia") ?? [];
+      const gpuLabel = nvidiaAdapters[gpuIndex]?.name ?? `NVIDIA device ${gpuIndex}`;
+      addLog(`NVENC GPU: ${gpuLabel} (device ${gpuIndex})`);
     }
     if (outputFormat) {
       addLog(`Output format: ${outputFormat.toUpperCase()}`);
     }
+    if (cpuThreads) {
+      addLog(`CPU limit: ${cpuLimit}% (${cpuThreads} threads)`);
+    }
+    addLog(`Max concurrent: ${maxConcurrent}`);
 
     addLog(`Starting ${queue.length} conversion(s)...`);
     setActiveTab("progress");
 
-    let startedCount = 0;
-    const failures: QueueFile[] = [];
+    let resolvedOutputDir = outputDir;
+    if (!resolvedOutputDir) {
+      try {
+        const autoOutputDir = await invoke<string>("get_default_output_dir");
+        resolvedOutputDir = autoOutputDir;
+        setOutputDir(autoOutputDir);
+        addLog(`Using default output directory: ${autoOutputDir}`);
+      } catch (err) {
+        addLog(`Failed to resolve default output directory: ${String(err)}`);
+      }
+    }
+
+    if (!resolvedOutputDir) {
+      const message = "No output directory available. Please select one in Settings.";
+      setErrorMessage(message);
+      addLog(message);
+      setActiveTab("queue");
+      return;
+    }
+
+    // Build all conversion items as pending
+    const params: ConversionParams = { encoder: selectedEncoder, gpuIndex, cpuThreads, preset };
+    const newItems: ConversionItem[] = [];
 
     for (const file of queue) {
       const inputFile = file.path;
       const baseName = getFileBase(getFileName(inputFile));
       const ext = outputFormat || getFileExt(getFileName(inputFile)) || "mp4";
-      const targetDir = outputDir || getFileDir(inputFile);
-      if (!targetDir) {
-        addLog(`No output directory for: ${getFileName(inputFile)}`);
-        failures.push(file);
-        continue;
-      }
-      const outputFile = joinPath(targetDir, `${baseName}_converted.${ext}`);
+      const outputFile = joinPath(resolvedOutputDir, `${baseName}_converted.${ext}`);
 
-      try {
-        const taskId = await invoke<string>("start_conversion", {
-          args: {
-            inputFile,
-            outputFile,
-            encoder: selectedEncoder,
-            gpuIndex,
-            preset,
-            isAdobePreset: false,
-          },
-        });
-
-        setConversions(prev => [
-          ...prev,
-          {
-            id: taskId,
-            inputFile,
-            outputFile,
-            status: "converting",
-            progress: 0,
-          },
-        ]);
-        startedCount += 1;
-      } catch (err) {
-        console.error("Failed to start conversion:", err);
-        addLog(`Failed to start: ${getFileName(inputFile)} (${String(err)})`);
-        failures.push(file);
-      }
+      newItems.push({
+        id: `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        inputFile,
+        outputFile,
+        status: "pending",
+        progress: 0,
+        params,
+      });
     }
 
-    if (startedCount === queue.length) {
-      setQueue([]);
-    } else {
-      setQueue(failures);
-      setErrorMessage(`Failed to start ${failures.length} conversion(s). Check Logs for details.`);
-      if (startedCount === 0) {
-        setActiveTab("queue");
+    setConversions(prev => [...prev, ...newItems]);
+    setQueue([]);
+
+    // Start up to maxConcurrent immediately
+    let started = 0;
+    for (const item of newItems) {
+      if (started >= maxConcurrent) break;
+      const taskId = await startPendingConversion(item);
+      if (taskId) {
+        setConversions(prev => prev.map(c =>
+          c.id === item.id ? { ...c, id: taskId, status: "converting" as ConversionStatus } : c
+        ));
+        started++;
+      } else {
+        setConversions(prev => prev.map(c =>
+          c.id === item.id ? { ...c, status: "failed" as ConversionStatus, failureMessage: "Failed to start" } : c
+        ));
       }
     }
   };
@@ -1080,6 +1166,29 @@ export default function App() {
                 <option value="veryslow">Very Slow</option>
               </select>
               <p className="help-text">Faster = larger files, Slower = better compression</p>
+            </div>
+
+            <div className="form-group">
+              <label><i className="ri-cpu-line"></i> CPU Limit</label>
+              <select className="select" value={cpuLimit} onChange={(e) => setCpuLimit(Number(e.target.value))}>
+                <option value={100}>100% (No limit)</option>
+                <option value={75}>75%</option>
+                <option value={50}>50%</option>
+                <option value={25}>25%</option>
+              </select>
+              <p className="help-text">Limit CPU threads per conversion to keep your system responsive</p>
+            </div>
+
+            <div className="form-group">
+              <label><i className="ri-stack-fill"></i> Max Concurrent</label>
+              <select className="select" value={maxConcurrent} onChange={(e) => setMaxConcurrent(Number(e.target.value))}>
+                <option value={1}>1</option>
+                <option value={2}>2</option>
+                <option value={3}>3 (Default)</option>
+                <option value={4}>4</option>
+                <option value={5}>5</option>
+              </select>
+              <p className="help-text">Maximum files converting at the same time</p>
             </div>
 
             <button className="button button-add-files" onClick={handleAddFiles}>
@@ -1293,7 +1402,7 @@ export default function App() {
         </div>
 
         <footer className="footer">
-          <i className="ri-video-fill"></i> Dreamcodec v2.2.5 • Made by Thornvald
+          <i className="ri-video-fill"></i> Dreamcodec v2.2.6 • Made by Thornvald
         </footer>
       </div>
     </>

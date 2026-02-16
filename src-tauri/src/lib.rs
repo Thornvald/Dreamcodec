@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::path::{PathBuf, Path};
 use tauri::{State, Manager, Emitter};
@@ -68,6 +69,8 @@ struct StartConversionArgs {
     encoder: String,
     #[serde(alias = "gpuIndex")]
     gpu_index: Option<u32>,
+    #[serde(alias = "cpuThreads")]
+    cpu_threads: Option<u32>,
     preset: String,
     #[serde(alias = "isAdobePreset")]
     is_adobe_preset: Option<bool>,
@@ -75,17 +78,50 @@ struct StartConversionArgs {
 
 #[tauri::command]
 fn get_default_output_dir() -> Result<String, String> {
-    let base = dirs::document_dir()
-        .map(|dir| dir.join("Videos"))
-        .or_else(dirs::video_dir)
-        .or_else(|| dirs::home_dir().map(|dir| dir.join("Videos")))
-        .ok_or_else(|| "Could not determine a default output directory".to_string())?;
+    let mut candidate_bases = Vec::new();
 
-    let target = base.join("Dreamcodec Output");
-    std::fs::create_dir_all(&target)
-        .map_err(|e| format!("Failed to create output directory: {}", e))?;
+    // Prefer the system Videos folder (e.g. C:\Users\<user>\Videos)
+    if let Some(videos) = dirs::video_dir() {
+        candidate_bases.push(videos);
+    }
 
-    Ok(target.to_string_lossy().to_string())
+    #[cfg(target_os = "windows")]
+    if let Some(user_profile) = std::env::var_os("USERPROFILE") {
+        candidate_bases.push(PathBuf::from(user_profile).join("Videos"));
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        candidate_bases.push(home.join("Videos"));
+    }
+
+    if candidate_bases.is_empty() {
+        return Err("Could not determine a default output directory".to_string());
+    }
+
+    let mut seen = HashSet::new();
+    let mut errors = Vec::new();
+
+    for base in candidate_bases {
+        let dedupe_key = base.to_string_lossy().to_lowercase();
+        if !seen.insert(dedupe_key) {
+            continue;
+        }
+
+        let target = base.join("Dreamcodec Output");
+        match std::fs::create_dir_all(&target) {
+            Ok(_) => return Ok(target.to_string_lossy().to_string()),
+            Err(e) => errors.push(format!("{} ({})", target.display(), e)),
+        }
+    }
+
+    if errors.is_empty() {
+        Err("Failed to create output directory for unknown reason".to_string())
+    } else {
+        Err(format!(
+            "Failed to create default output directory. Tried: {}",
+            errors.join("; ")
+        ))
+    }
 }
 
 async fn detect_cpu_name() -> Option<String> {
@@ -363,6 +399,7 @@ async fn start_conversion(
             output_file: output_file.ok_or_else(|| "Missing output_file".to_string())?,
             encoder: encoder.unwrap_or_else(|| "libx264".to_string()),
             gpu_index,
+            cpu_threads: None,
             preset: preset.unwrap_or_else(|| "fast".to_string()),
             is_adobe_preset,
         }
@@ -372,6 +409,7 @@ async fn start_conversion(
         output_file,
         encoder,
         gpu_index,
+        cpu_threads,
         preset,
         is_adobe_preset,
     } = resolved;
@@ -428,6 +466,7 @@ async fn start_conversion(
         ffmpeg_path_str,
         encoder,
         gpu_index,
+        cpu_threads,
         preset,
         is_adobe_preset.unwrap_or(false),
     ).map_err(|e| e.to_string())?;

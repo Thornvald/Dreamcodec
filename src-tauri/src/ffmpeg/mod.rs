@@ -10,10 +10,15 @@ use tokio::fs;
 
 use futures::StreamExt;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
-// Windows creation flag to hide console window
+
+// Windows creation flags
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(target_os = "windows")]
+const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
 
 // Supported video formats
 pub const VIDEO_FORMATS: &[&str] = &["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ogv"];
@@ -639,6 +644,7 @@ pub struct ConversionTask {
     pub ffmpeg_path: String,
     pub encoder: String,
     pub gpu_index: Option<u32>,
+    pub cpu_threads: Option<u32>,
     pub preset: String,
     pub is_adobe_preset: bool,
     pub adobe_preset: Option<AdobePreset>,
@@ -666,6 +672,7 @@ impl FfmpegManager {
         ffmpeg_path: String,
         encoder: String,
         gpu_index: Option<u32>,
+        cpu_threads: Option<u32>,
         preset: String,
         is_adobe_preset: bool,
     ) -> Result<(), String> {
@@ -694,6 +701,7 @@ impl FfmpegManager {
             ffmpeg_path: ffmpeg_path.clone(),
             encoder: encoder.clone(),
             gpu_index,
+            cpu_threads,
             preset: preset.clone(),
             is_adobe_preset,
             adobe_preset,
@@ -774,9 +782,9 @@ impl FfmpegManager {
 fn kill_process(pid: u32) {
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output();
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let _ = cmd.args(["/PID", &pid.to_string(), "/T", "/F"]).output();
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -788,7 +796,7 @@ fn kill_process(pid: u32) {
 }
 
 async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
-    let (input_file, output_file, ffmpeg_path, encoder, gpu_index, preset, is_adobe_preset, adobe_preset) = {
+    let (input_file, output_file, ffmpeg_path, encoder, gpu_index, cpu_threads, preset, is_adobe_preset, adobe_preset) = {
         let task = task_arc.lock().unwrap();
         (
             task.input_file.clone(),
@@ -796,269 +804,362 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
             task.ffmpeg_path.clone(),
             task.encoder.clone(),
             task.gpu_index,
+            task.cpu_threads,
             task.preset.clone(),
             task.is_adobe_preset,
             task.adobe_preset.clone(),
         )
     };
 
-    // Build FFmpeg command
-    let mut args = vec!["-y".to_string()];
-
-    // When NVENC is selected, also try to decode on GPU to avoid CPU-heavy software decode.
-    if encoder.contains("nvenc") {
-        args.push("-hwaccel".to_string());
-        args.push("cuda".to_string());
-        args.push("-hwaccel_output_format".to_string());
-        args.push("cuda".to_string());
-        if let Some(index) = gpu_index {
-            args.push("-hwaccel_device".to_string());
-            args.push(index.to_string());
-        }
-    }
-    args.push("-i".to_string());
-    args.push(input_file.clone());
-
-    // Add stream mapping for video formats
     let output_ext = Path::new(&output_file)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("mp4")
         .to_lowercase();
-    
     let format_info = get_format_info(&output_ext);
 
-    if format_info.supports_video {
-        args.push("-map".to_string());
-        args.push("0:v?".to_string());
-    }
-    if format_info.supports_audio {
-        args.push("-map".to_string());
-        if format_info.supports_video {
-            args.push("0:a?".to_string());
-        } else {
-            // Audio-only outputs should only include the first audio stream.
-            args.push("0:a:0?".to_string());
-        }
-    }
+    let is_nvenc = encoder.contains("nvenc");
+    let is_amf = encoder.contains("amf");
+    let is_qsv = encoder.contains("qsv");
+    let is_gpu_encoder = is_nvenc || is_amf || is_qsv;
+    // For GPU encoders we try up to 3 strategies:
+    //   0 — hardware decode + GPU encode (best performance)
+    //   1 — software decode + GPU encode (decode compatibility)
+    //   2 — software decode + GPU encode + forced nv12 pixel format (max compatibility)
+    let max_attempts: usize = if is_gpu_encoder { 3 } else { 1 };
 
-    if is_adobe_preset {
-        // Adobe preset handling
-        if let Some(ref preset_config) = adobe_preset {
-            args.push("-c:v".to_string());
-            args.push(preset_config.encoder.clone());
-            
-            // Add encoder options
-            for opt in &preset_config.encoder_options {
-                args.push(opt.clone());
-            }
-            
-            args.push("-pix_fmt".to_string());
-            args.push(preset_config.pixel_format.clone());
-            
-            // For ProRes and DNxHD, audio should be PCM or AAC
-            if preset_config.encoder == "prores_ks" || preset_config.encoder == "dnxhd" {
-                args.push("-c:a".to_string());
-                args.push("pcm_s16le".to_string());
-            }
-        }
-    } else {
-        // Standard encoder handling
-        if format_info.supports_video {
-            args.push("-c:v".to_string());
-            args.push(encoder.clone());
-            
-            // Add preset for compatible encoders
-            if encoder.contains("nvenc") || encoder == "libx264" || encoder == "libx265" {
-                args.push("-preset".to_string());
-                args.push(preset.clone());
-            }
+    for attempt in 0..max_attempts {
+        let use_hw_decode = is_gpu_encoder && attempt == 0;
+        let force_nv12 = is_gpu_encoder && attempt == 2;
 
-            // Add pixel format for NVENC
-            if encoder.contains("nvenc") {
+        // Build FFmpeg command
+        let mut args = vec![
+            "-y".to_string(),
+            "-hide_banner".to_string(),
+            "-progress".to_string(),
+            "pipe:2".to_string(),
+            "-nostats".to_string(),
+        ];
+
+        // Hardware-accelerated decode on the first attempt for GPU encoders.
+        // NOTE: We intentionally omit -hwaccel_output_format so that FFmpeg
+        // can perform pixel-format conversion (e.g. 10-bit HEVC → 8-bit NV12)
+        // between decode and encode.  This fixes iPhone MOV/HEVC files that would
+        // otherwise fail due to incompatible pixel formats in GPU memory.
+        if use_hw_decode {
+            args.push("-hwaccel".to_string());
+            if is_nvenc {
+                // NVIDIA: use CUDA specifically
+                args.push("cuda".to_string());
                 if let Some(index) = gpu_index {
-                    args.push("-gpu".to_string());
+                    args.push("-hwaccel_device".to_string());
                     args.push(index.to_string());
                 }
-            }
-        }
-
-        // Audio codec
-        if format_info.supports_audio {
-            args.push("-c:a".to_string());
-            if format_info.default_audio_codec.is_empty() {
-                args.push("copy".to_string());
             } else {
-                args.push(format_info.default_audio_codec.to_string());
+                // AMD/Intel: let FFmpeg pick the best available (D3D11VA, VAAPI, etc.)
+                args.push("auto".to_string());
             }
         }
-    }
 
-    args.push(output_file.clone());
+        // Limit CPU threads when configured
+        if let Some(threads) = cpu_threads {
+            args.push("-threads".to_string());
+            args.push(threads.to_string());
+        }
 
-    // Update status to running
-    {
-        let mut task = task_arc.lock().unwrap();
-        task.progress.status = ConversionStatus::Running;
-        if encoder.contains("nvenc") {
+        args.push("-i".to_string());
+        args.push(input_file.clone());
+
+        // Add stream mapping for video formats
+        if format_info.supports_video {
+            args.push("-map".to_string());
+            args.push("0:v?".to_string());
+        }
+        if format_info.supports_audio {
+            args.push("-map".to_string());
+            if format_info.supports_video {
+                args.push("0:a?".to_string());
+            } else {
+                // Audio-only outputs should only include the first audio stream.
+                args.push("0:a:0?".to_string());
+            }
+        }
+
+        if is_adobe_preset {
+            // Adobe preset handling
+            if let Some(ref preset_config) = adobe_preset {
+                args.push("-c:v".to_string());
+                args.push(preset_config.encoder.clone());
+
+                // Add encoder options
+                for opt in &preset_config.encoder_options {
+                    args.push(opt.clone());
+                }
+
+                args.push("-pix_fmt".to_string());
+                args.push(preset_config.pixel_format.clone());
+
+                // For ProRes and DNxHD, audio should be PCM or AAC
+                if preset_config.encoder == "prores_ks" || preset_config.encoder == "dnxhd" {
+                    args.push("-c:a".to_string());
+                    args.push("pcm_s16le".to_string());
+                }
+            }
+        } else {
+            // Standard encoder handling
+            if format_info.supports_video {
+                args.push("-c:v".to_string());
+                args.push(encoder.clone());
+
+                // Add preset for compatible encoders
+                if is_nvenc || encoder == "libx264" || encoder == "libx265" {
+                    args.push("-preset".to_string());
+                    args.push(preset.clone());
+                }
+
+                // Select specific NVIDIA GPU for NVENC
+                if is_nvenc {
+                    if let Some(index) = gpu_index {
+                        args.push("-gpu".to_string());
+                        args.push(index.to_string());
+                    }
+                }
+
+                // On the last retry, force NV12 pixel format for GPU encoders.
+                // This handles inputs with incompatible pixel formats (e.g. 10-bit
+                // HEVC from iPhone MOV) that the encoder cannot auto-negotiate.
+                // We only do this as a fallback because explicitly setting -pix_fmt
+                // can conflict with hardware acceleration pipelines.
+                if force_nv12 {
+                    args.push("-pix_fmt".to_string());
+                    args.push("nv12".to_string());
+                }
+            }
+
+            // Audio codec
+            if format_info.supports_audio {
+                args.push("-c:a".to_string());
+                if format_info.default_audio_codec.is_empty() {
+                    args.push("copy".to_string());
+                } else {
+                    args.push(format_info.default_audio_codec.to_string());
+                }
+            }
+        }
+
+        args.push(output_file.clone());
+
+        // Update status to running
+        {
+            let mut task = task_arc.lock().unwrap();
+            task.progress.status = ConversionStatus::Running;
+            if attempt == 1 {
+                task.progress.log.push(
+                    "Retrying with software decode + GPU encode...".to_string(),
+                );
+                task.progress.percentage = 0.0;
+                task.progress.current_time = 0.0;
+                task.progress.duration = 0.0;
+                task.progress.error_message = None;
+            } else if attempt == 2 {
+                task.progress.log.push(
+                    "Retrying with forced NV12 pixel format...".to_string(),
+                );
+                task.progress.percentage = 0.0;
+                task.progress.current_time = 0.0;
+                task.progress.duration = 0.0;
+                task.progress.error_message = None;
+            } else if is_gpu_encoder {
+                let hw_label = if is_nvenc {
+                    "NVENC + CUDA hardware decode"
+                } else if is_amf {
+                    "AMF + hardware decode"
+                } else {
+                    "QSV + hardware decode"
+                };
+                task.progress
+                    .log
+                    .push(format!("GPU encode selected: using {}.", hw_label));
+            }
             task.progress
                 .log
-                .push("NVENC selected: attempting CUDA hardware decode + GPU encode.".to_string());
+                .push(format!("FFmpeg args: {}", args.join(" ")));
         }
-        task.progress
-            .log
-            .push(format!("FFmpeg args: {}", args.join(" ")));
-    }
 
-    // Run FFmpeg
-    println!("=== FFmpeg Start ===");
-    println!("FFmpeg path: {}", ffmpeg_path);
-    println!("Encoder: {}", encoder);
-    println!("Preset: {}", preset);
-    println!("Input: {}", input_file);
-    println!("Output: {}", output_file);
-    println!("Args: {:?}", args);
-    let spawn_ffmpeg = |use_hwaccel: bool| -> Result<Child, std::io::Error> {
-        let actual_args = if use_hwaccel {
-            args.clone()
-        } else {
-            // Fallback args remove explicit CUDA decode flags, keeping NVENC encode enabled.
-            let mut filtered: Vec<String> = Vec::with_capacity(args.len());
-            let mut i = 0;
-            while i < args.len() {
-                let arg = &args[i];
-                if arg == "-hwaccel" || arg == "-hwaccel_output_format" || arg == "-hwaccel_device" {
-                    i += 2;
-                    continue;
-                }
-                filtered.push(arg.clone());
-                i += 1;
-            }
-            filtered
-        };
+        // Run FFmpeg
+        println!("=== FFmpeg Start (attempt {}) ===", attempt + 1);
+        println!("FFmpeg path: {}", ffmpeg_path);
+        println!("Encoder: {}", encoder);
+        println!("Input: {}", input_file);
+        println!("Output: {}", output_file);
+        println!("Args: {:?}", args);
 
         let mut cmd = Command::new(&ffmpeg_path);
-        cmd.args(&actual_args)
+        cmd.args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(target_os = "windows")]
-        cmd.creation_flags(CREATE_NO_WINDOW);
-        cmd.spawn()
-    };
+        cmd.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
 
-    let child = match spawn_ffmpeg(true) {
-        Ok(child) => child,
-        Err(first_err) => {
-            if encoder.contains("nvenc") {
-                println!("CUDA decode path failed to start, retrying without CUDA decode flags: {}", first_err);
-                {
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                if attempt < max_attempts - 1 {
                     let mut task = task_arc.lock().unwrap();
                     task.progress.log.push(format!(
-                        "CUDA decode start failed ({}). Retrying with GPU encode + software decode.",
-                        first_err
+                        "FFmpeg start failed ({}). Will retry with software decode...",
+                        e
                     ));
+                    continue;
                 }
-                match spawn_ffmpeg(false) {
-                    Ok(child) => child,
-                    Err(second_err) => {
-                        let mut task = task_arc.lock().unwrap();
-                        let message = format!(
-                            "Failed to start ffmpeg: {} (fallback also failed: {}) (path: {})",
-                            first_err, second_err, ffmpeg_path
-                        );
-                        task.progress.status = ConversionStatus::Failed(message.clone());
-                        task.progress.error_message = Some(message);
-                        return;
-                    }
-                }
-            } else {
                 let mut task = task_arc.lock().unwrap();
-                let message = format!("Failed to start ffmpeg: {} (path: {})", first_err, ffmpeg_path);
+                let message =
+                    format!("Failed to start ffmpeg: {} (path: {})", e, ffmpeg_path);
                 task.progress.status = ConversionStatus::Failed(message.clone());
                 task.progress.error_message = Some(message);
                 return;
             }
-        }
-    };
+        };
 
-    // Read output
-    let time_regex = Regex::new(r"time=(\d+):(\d+):(\d+\.\d+)").unwrap();
-    let duration_regex = Regex::new(r"Duration: (\d+):(\d+):(\d+\.\d+)").unwrap();
+        // Read output
+        let time_regex = Regex::new(r"time=(\d+):(\d+):(\d+\.\d+)").unwrap();
+        let out_time_regex = Regex::new(r"out_time=(\d+):(\d+):(\d+\.\d+)").unwrap();
+        let out_time_us_regex = Regex::new(r"out_time_us=(\d+)").unwrap();
+        let out_time_ms_regex = Regex::new(r"out_time_ms=(\d+)").unwrap();
+        let duration_regex = Regex::new(r"Duration: (\d+):(\d+):(\d+\.\d+)").unwrap();
 
-    // We need to get a new reference to process for reading
-    let mut process_ref = {
-        let mut task = task_arc.lock().unwrap();
-        task.process = Some(child);
-        task.pid = task.process.as_ref().and_then(|proc| proc.id());
-        task.process.take().unwrap()
-    };
-
-    let mut last_log_line: Option<String> = None;
-
-    if let Some(stderr) = process_ref.stderr.take() {
-        let reader = BufReader::new(stderr);
-        let mut lines = reader.lines();
-
-        while let Ok(Some(line)) = lines.next_line().await {
-            last_log_line = Some(line.clone());
+        let mut process_ref = {
             let mut task = task_arc.lock().unwrap();
-            task.progress.log.push(line.clone());
+            task.process = Some(child);
+            task.pid = task.process.as_ref().and_then(|proc| proc.id());
+            task.process.take().unwrap()
+        };
 
-            // Parse duration from FFmpeg initial output
-            if task.progress.duration == 0.0 {
-                if let Some(captures) = duration_regex.captures(&line) {
-                    let hours: f64 = captures[1].parse().unwrap_or(0.0);
-                    let minutes: f64 = captures[2].parse().unwrap_or(0.0);
-                    let seconds: f64 = captures[3].parse().unwrap_or(0.0);
-                    task.progress.duration = hours * 3600.0 + minutes * 60.0 + seconds;
-                    println!("Parsed duration: {} seconds", task.progress.duration);
+        let mut last_log_line: Option<String> = None;
+
+        if let Some(stderr) = process_ref.stderr.take() {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                last_log_line = Some(line.clone());
+                let mut task = task_arc.lock().unwrap();
+                task.progress.log.push(line.clone());
+
+                // Parse duration from FFmpeg initial output
+                if task.progress.duration == 0.0 {
+                    if let Some(captures) = duration_regex.captures(&line) {
+                        let hours: f64 = captures[1].parse().unwrap_or(0.0);
+                        let minutes: f64 = captures[2].parse().unwrap_or(0.0);
+                        let seconds: f64 = captures[3].parse().unwrap_or(0.0);
+                        task.progress.duration =
+                            hours * 3600.0 + minutes * 60.0 + seconds;
+                        println!(
+                            "Parsed duration: {} seconds",
+                            task.progress.duration
+                        );
+                    }
                 }
-            }
 
-            // Parse progress
-            if let Some(captures) = time_regex.captures(&line) {
-                let hours: f64 = captures[1].parse().unwrap_or(0.0);
-                let minutes: f64 = captures[2].parse().unwrap_or(0.0);
-                let seconds: f64 = captures[3].parse().unwrap_or(0.0);
-                let current_time = hours * 3600.0 + minutes * 60.0 + seconds;
+                // Parse progress
+                let parsed_time =
+                    if let Some(captures) = time_regex.captures(&line) {
+                        let hours: f64 = captures[1].parse().unwrap_or(0.0);
+                        let minutes: f64 = captures[2].parse().unwrap_or(0.0);
+                        let seconds: f64 = captures[3].parse().unwrap_or(0.0);
+                        Some(hours * 3600.0 + minutes * 60.0 + seconds)
+                    } else if let Some(captures) = out_time_regex.captures(&line)
+                    {
+                        let hours: f64 = captures[1].parse().unwrap_or(0.0);
+                        let minutes: f64 = captures[2].parse().unwrap_or(0.0);
+                        let seconds: f64 = captures[3].parse().unwrap_or(0.0);
+                        Some(hours * 3600.0 + minutes * 60.0 + seconds)
+                    } else if let Some(captures) =
+                        out_time_us_regex.captures(&line)
+                    {
+                        let out_time_us: f64 =
+                            captures[1].parse().unwrap_or(0.0);
+                        Some(out_time_us / 1_000_000.0)
+                    } else if let Some(captures) =
+                        out_time_ms_regex.captures(&line)
+                    {
+                        let out_time_ms: f64 =
+                            captures[1].parse().unwrap_or(0.0);
+                        // Some FFmpeg builds label this key as ms while reporting microseconds.
+                        Some(out_time_ms / 1_000_000.0)
+                    } else {
+                        None
+                    };
 
-                task.progress.current_time = current_time;
-                if task.progress.duration > 0.0 {
-                    task.progress.percentage = (current_time / task.progress.duration) * 100.0;
-                }
-            }
-        }
-    }
-
-    // Wait for process to complete
-    let status = process_ref.wait().await;
-
-    {
-        let mut task = task_arc.lock().unwrap();
-        task.process = None;
-        task.pid = None;
-        match status {
-            Ok(exit_status) => {
-                if exit_status.success() {
-                    task.progress.status = ConversionStatus::Completed;
-                    task.progress.percentage = 100.0;
-                } else {
-                    let message = last_log_line
-                        .clone()
-                        .unwrap_or_else(|| format!("FFmpeg exited with code: {:?}", exit_status.code()));
-                    task.progress.status = ConversionStatus::Failed(message.clone());
-                    if task.progress.error_message.is_none() {
-                        task.progress.error_message = Some(message);
+                if let Some(current_time) = parsed_time {
+                    task.progress.current_time =
+                        current_time.max(task.progress.current_time);
+                    if task.progress.duration > 0.0 {
+                        task.progress.percentage =
+                            ((task.progress.current_time / task.progress.duration)
+                                * 100.0)
+                                .min(100.0);
                     }
                 }
             }
-            Err(e) => {
-                let message = e.to_string();
-                task.progress.status = ConversionStatus::Failed(message.clone());
-                if task.progress.error_message.is_none() {
-                    task.progress.error_message = Some(message);
+        }
+
+        // Wait for process to complete
+        let status = process_ref.wait().await;
+
+        let succeeded = {
+            let mut task = task_arc.lock().unwrap();
+            task.process = None;
+            task.pid = None;
+            match status {
+                Ok(exit_status) if exit_status.success() => {
+                    task.progress.status = ConversionStatus::Completed;
+                    task.progress.percentage = 100.0;
+                    true
+                }
+                Ok(exit_status) => {
+                    let message = last_log_line
+                        .clone()
+                        .unwrap_or_else(|| {
+                            format!(
+                                "FFmpeg exited with code: {:?}",
+                                exit_status.code()
+                            )
+                        });
+                    task.progress.status =
+                        ConversionStatus::Failed(message.clone());
+                    if task.progress.error_message.is_none() {
+                        task.progress.error_message = Some(message);
+                    }
+                    false
+                }
+                Err(e) => {
+                    let message = e.to_string();
+                    task.progress.status =
+                        ConversionStatus::Failed(message.clone());
+                    if task.progress.error_message.is_none() {
+                        task.progress.error_message = Some(message);
+                    }
+                    false
                 }
             }
+        };
+
+        if succeeded {
+            return;
+        }
+
+        // If more attempts remain, clean up and retry with a different strategy
+        if attempt < max_attempts - 1 {
+            {
+                let mut task = task_arc.lock().unwrap();
+                task.progress.log.push(
+                    "Conversion failed. Trying next fallback strategy..."
+                        .to_string(),
+                );
+            }
+            let _ = std::fs::remove_file(&output_file);
+            continue;
         }
     }
 }
