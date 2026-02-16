@@ -6,12 +6,16 @@ use tokio::process::Command;
 use regex::Regex;
 use uuid::Uuid;
 use serde::{Deserialize, Serialize};
+use log::{info, error};
 
 mod ffmpeg;
 mod gpu;
+mod logger;
+mod error;
 
 use ffmpeg::{FfmpegManager, ConversionProgress, FfmpegDownloader, FfmpegLocator, AdobePreset, get_adobe_presets, VIDEO_FORMATS, AUDIO_FORMATS, get_format_info};
 use gpu::{GpuDetector, EncoderInfo, GpuInfo};
+use error::AppError;
 
 // Windows creation flag to hide console window
 #[cfg(target_os = "windows")]
@@ -77,7 +81,19 @@ struct StartConversionArgs {
 }
 
 #[tauri::command]
-fn get_default_output_dir() -> Result<String, String> {
+fn get_log_file_path(app_handle: tauri::AppHandle) -> Result<PathBuf, AppError> {
+    let log_dir = app_handle.path().app_log_dir().map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(log_dir.join(logger::LOG_FILE_NAME))
+}
+
+#[tauri::command]
+async fn get_log_file_content(app_handle: tauri::AppHandle) -> Result<String, AppError> {
+    let log_path = get_log_file_path(app_handle)?;
+    tokio::fs::read_to_string(log_path).await.map_err(|e| e.into())
+}
+
+#[tauri::command]
+fn get_default_output_dir() -> Result<String, AppError> {
     let mut candidate_bases = Vec::new();
 
     // Prefer the system Videos folder (e.g. C:\Users\<user>\Videos)
@@ -95,7 +111,7 @@ fn get_default_output_dir() -> Result<String, String> {
     }
 
     if candidate_bases.is_empty() {
-        return Err("Could not determine a default output directory".to_string());
+        return Err(AppError::Internal("Could not determine a default output directory".to_string()));
     }
 
     let mut seen = HashSet::new();
@@ -115,12 +131,12 @@ fn get_default_output_dir() -> Result<String, String> {
     }
 
     if errors.is_empty() {
-        Err("Failed to create output directory for unknown reason".to_string())
+        Err(AppError::Internal("Failed to create output directory for unknown reason".to_string()))
     } else {
-        Err(format!(
+        Err(AppError::Internal(format!(
             "Failed to create default output directory. Tried: {}",
             errors.join("; ")
-        ))
+        )))
     }
 }
 
@@ -175,7 +191,7 @@ async fn detect_cpu_name() -> Option<String> {
 }
 
 #[tauri::command]
-async fn get_cpu_info() -> Result<CpuInfo, String> {
+async fn get_cpu_info() -> Result<CpuInfo, AppError> {
     let logical_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(0);
@@ -247,14 +263,14 @@ async fn initialize_ffmpeg(state: &AppState) -> FfmpegStatus {
 
 // Command: Check if FFmpeg is available (auto-detect)
 #[tauri::command]
-async fn check_ffmpeg(state: State<'_, AppState>) -> Result<FfmpegStatus, String> {
+async fn check_ffmpeg(state: State<'_, AppState>) -> Result<FfmpegStatus, AppError> {
     let status = initialize_ffmpeg(&state).await;
     Ok(status)
 }
 
 // Command: Download FFmpeg
 #[tauri::command]
-async fn download_ffmpeg(app_handle: tauri::AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+async fn download_ffmpeg(app_handle: tauri::AppHandle, state: State<'_, AppState>) -> Result<String, AppError> {
     let window = app_handle.get_webview_window("main");
     
     let progress_callback = move |downloaded: u64, total: u64| {
@@ -278,17 +294,17 @@ async fn download_ffmpeg(app_handle: tauri::AppHandle, state: State<'_, AppState
     let ffmpeg_path = FfmpegDownloader::download_and_extract_ffmpeg(progress_callback).await?;
     
     // Update state with the new path
-    let mut state_path = state.ffmpeg_path.lock().map_err(|e| e.to_string())?;
+    let mut state_path = state.ffmpeg_path.lock().map_err(|e| AppError::Internal(e.to_string()))?;
     *state_path = Some(ffmpeg_path.clone());
     
     Ok(ffmpeg_path.to_string_lossy().to_string())
 }
 
 // Get the FFmpeg path from state or auto-detect
-async fn get_ffmpeg_path(state: &AppState) -> Result<PathBuf, String> {
+async fn get_ffmpeg_path(state: &AppState) -> Result<PathBuf, AppError> {
     // First check if we have a stored path
     {
-        let stored = state.ffmpeg_path.lock().map_err(|e| e.to_string())?;
+        let stored = state.ffmpeg_path.lock().map_err(|e| AppError::Internal(e.to_string()))?;
         if let Some(ref path) = *stored {
             if path.exists() {
                 return Ok(path.clone());
@@ -298,77 +314,47 @@ async fn get_ffmpeg_path(state: &AppState) -> Result<PathBuf, String> {
 
     // Try to auto-detect
     if let Some(path) = FfmpegLocator::find_ffmpeg().await {
-        let mut stored = state.ffmpeg_path.lock().map_err(|e| e.to_string())?;
+        let mut stored = state.ffmpeg_path.lock().map_err(|e| AppError::Internal(e.to_string()))?;
         *stored = Some(path.clone());
         return Ok(path);
     }
 
-    Err("FFmpeg not found. Please install FFmpeg or restart the application.".to_string())
+    Err(AppError::Ffmpeg("FFmpeg not found. Please install FFmpeg or restart the application.".to_string()))
 }
 
 // Command: Get available GPU encoders
 #[tauri::command]
-async fn get_gpu_info(state: State<'_, AppState>) -> Result<GpuInfo, String> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
-    let log_path = std::env::temp_dir().join("dreamcodec-debug.log");
-    let log_write = |msg: &str| {
-        let _ = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .and_then(|mut f| writeln!(f, "{}", msg));
-        println!("{}", msg);
-    };
-
-    log_write("=== get_gpu_info called ===");
-
-    // Try to get ffmpeg path
-    let ffmpeg_path_result = get_ffmpeg_path(&state).await;
-    log_write(&format!("FFmpeg path result: {:?}", ffmpeg_path_result));
-
-    let ffmpeg_path = ffmpeg_path_result.ok().map(|p| {
-        let path_str = p.to_string_lossy().to_string();
-        log_write(&format!("Using FFmpeg at: {}", path_str));
-        path_str
-    });
-
-    if ffmpeg_path.is_none() {
-        log_write("WARNING: FFmpeg path is None, will try to use 'ffmpeg' command");
-    }
+async fn get_gpu_info(state: State<'_, AppState>) -> Result<GpuInfo, AppError> {
+    let ffmpeg_path = get_ffmpeg_path(&state).await.ok().map(|p| p.to_string_lossy().to_string());
 
     let result = GpuDetector::detect_with_ffmpeg(ffmpeg_path.as_deref()).await;
-    log_write(&format!("GpuDetector result: {:?}", result));
-    log_write(&format!("Log file: {}", log_path.display()));
-
+    
     result.map_err(|e| {
-        let err_msg = e.to_string();
-        log_write(&format!("Error detecting GPU: {}", err_msg));
-        err_msg
+        error!("Error detecting GPU: {}", e);
+        AppError::Internal(e.to_string())
     })
 }
 
 // Command: Get available encoders from ffmpeg
 #[tauri::command]
-async fn get_available_encoders(state: State<'_, AppState>) -> Result<Vec<EncoderInfo>, String> {
+async fn get_available_encoders(state: State<'_, AppState>) -> Result<Vec<EncoderInfo>, AppError> {
     let ffmpeg_path = get_ffmpeg_path(&state).await?;
     GpuDetector::get_available_encoders(Some(&ffmpeg_path.to_string_lossy())).await
-        .map_err(|e| e.to_string())
+        .map_err(|e| AppError::Internal(e.to_string()))
 }
 
 // Command: Get FFmpeg version
 #[tauri::command]
-async fn get_ffmpeg_version(state: State<'_, AppState>) -> Result<String, String> {
+async fn get_ffmpeg_version(state: State<'_, AppState>) -> Result<String, AppError> {
     let ffmpeg_path = get_ffmpeg_path(&state).await?;
     let output = Command::new(&ffmpeg_path)
         .args(&["-version"])
         .output()
         .await
-        .map_err(|e| format!("Failed to run FFmpeg: {}", e))?;
+        .map_err(|e| AppError::Ffmpeg(format!("Failed to run FFmpeg: {}", e)))?;
     
     if !output.status.success() {
-        return Err("FFmpeg returned error".to_string());
+        return Err(AppError::Ffmpeg("FFmpeg returned error".to_string()));
     }
     
     let version = String::from_utf8_lossy(&output.stdout);
@@ -387,7 +373,7 @@ async fn start_conversion(
     is_adobe_preset: Option<bool>,
     args: Option<StartConversionArgs>,
     payload: Option<StartConversionArgs>,
-) -> Result<String, String> {
+) -> Result<String, AppError> {
     let task_id = Uuid::new_v4().to_string();
     let resolved = if let Some(args) = args {
         args
@@ -395,8 +381,8 @@ async fn start_conversion(
         payload
     } else {
         StartConversionArgs {
-            input_file: input_file.ok_or_else(|| "Missing input_file".to_string())?,
-            output_file: output_file.ok_or_else(|| "Missing output_file".to_string())?,
+            input_file: input_file.ok_or_else(|| AppError::Internal("Missing input_file".to_string()))?,
+            output_file: output_file.ok_or_else(|| AppError::Internal("Missing output_file".to_string()))?,
             encoder: encoder.unwrap_or_else(|| "libx264".to_string()),
             gpu_index,
             cpu_threads: None,
@@ -415,7 +401,7 @@ async fn start_conversion(
     } = resolved;
 
     if !std::path::Path::new(&input_file).exists() {
-        return Err(format!("Input file not found: {}", input_file));
+        return Err(AppError::Io(format!("Input file not found: {}", input_file)));
     }
 
     let output_ext = Path::new(&output_file)
@@ -427,7 +413,7 @@ async fn start_conversion(
 
     if let Some(parent) = std::path::Path::new(&output_file).parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create output directory: {}", e))?;
+            .map_err(|e| AppError::Io(format!("Failed to create output directory: {}", e)))?;
     }
 
     // Get FFmpeg path automatically
@@ -442,22 +428,17 @@ async fn start_conversion(
 
         let output = cmd.output()
             .await
-            .map_err(|e| format!("Failed to probe input: {}", e))?;
+            .map_err(|e| AppError::Ffmpeg(format!("Failed to probe input: {}", e)))?;
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         let info = ffmpeg::VideoInfo::parse(&stderr)?;
         if info.audio_streams.is_empty() {
-            return Err("Input has no audio stream; cannot create audio-only output.".to_string());
+            return Err(AppError::Ffmpeg("Input has no audio stream; cannot create audio-only output.".to_string()));
         }
     }
-
-    println!(
-        "start_conversion: input='{}' output='{}' encoder='{}' gpu_index={:?} preset='{}' adobe={:?}",
-        input_file, output_file, encoder, gpu_index, preset, is_adobe_preset
-    );
     
     let manager = state.ffmpeg_manager.clone();
-    let mut manager = manager.lock().map_err(|e| e.to_string())?;
+    let mut manager = manager.lock().map_err(|e| AppError::Internal(e.to_string()))?;
     
     manager.start_conversion(
         task_id.clone(),
@@ -469,7 +450,7 @@ async fn start_conversion(
         cpu_threads,
         preset,
         is_adobe_preset.unwrap_or(false),
-    ).map_err(|e| e.to_string())?;
+    )?;
     
     Ok(task_id)
 }
@@ -479,9 +460,9 @@ async fn start_conversion(
 async fn get_conversion_progress(
     state: State<'_, AppState>,
     task_id: String,
-) -> Result<Option<ConversionProgress>, String> {
+) -> Result<Option<ConversionProgress>, AppError> {
     let manager = state.ffmpeg_manager.clone();
-    let manager = manager.lock().map_err(|e| e.to_string())?;
+    let manager = manager.lock().map_err(|e| AppError::Internal(e.to_string()))?;
     
     Ok(manager.get_progress(&task_id))
 }
@@ -491,27 +472,27 @@ async fn get_conversion_progress(
 async fn cancel_conversion(
     state: State<'_, AppState>,
     task_id: String,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     let manager = state.ffmpeg_manager.clone();
-    let mut manager = manager.lock().map_err(|e| e.to_string())?;
+    let mut manager = manager.lock().map_err(|e| AppError::Internal(e.to_string()))?;
     
-    manager.cancel_conversion(&task_id).map_err(|e| e.to_string())
+    manager.cancel_conversion(&task_id)
 }
 
 // Command: Get video duration
 #[tauri::command]
-async fn get_video_duration(state: State<'_, AppState>, input_file: String) -> Result<f64, String> {
+async fn get_video_duration(state: State<'_, AppState>, input_file: String) -> Result<f64, AppError> {
     let ffmpeg_path = get_ffmpeg_path(&state).await?;
     let output = Command::new(&ffmpeg_path)
         .args(&["-i", &input_file])
         .output()
         .await
-        .map_err(|e| format!("Failed to probe video: {}", e))?;
+        .map_err(|e| AppError::Ffmpeg(format!("Failed to probe video: {}", e)))?;
     
     let stderr = String::from_utf8_lossy(&output.stderr);
     
     // Parse duration from FFmpeg output
-    let duration_regex = Regex::new(r"Duration: (\d+):(\d+):(\d+\.\d+)").unwrap();
+    let duration_regex = Regex::new(r"Duration: (\d+):(\d+):(\d+\.\d+)").map_err(|e| AppError::Internal(e.to_string()))?;
     
     if let Some(captures) = duration_regex.captures(&stderr) {
         let hours: f64 = captures[1].parse().unwrap_or(0.0);
@@ -522,18 +503,18 @@ async fn get_video_duration(state: State<'_, AppState>, input_file: String) -> R
         return Ok(total_seconds);
     }
     
-    Err("Could not determine video duration".to_string())
+    Err(AppError::Ffmpeg("Could not determine video duration".to_string()))
 }
 
 // Command: Get video streams info
 #[tauri::command]
-async fn get_video_info(state: State<'_, AppState>, input_file: String) -> Result<ffmpeg::VideoInfo, String> {
+async fn get_video_info(state: State<'_, AppState>, input_file: String) -> Result<ffmpeg::VideoInfo, AppError> {
     let ffmpeg_path = get_ffmpeg_path(&state).await?;
     let output = Command::new(&ffmpeg_path)
         .args(&["-hide_banner", "-i", &input_file])
         .output()
         .await
-        .map_err(|e| format!("Failed to probe video: {}", e))?;
+        .map_err(|e| AppError::Ffmpeg(format!("Failed to probe video: {}", e)))?;
     
     let stderr = String::from_utf8_lossy(&output.stderr);
     
@@ -543,7 +524,7 @@ async fn get_video_info(state: State<'_, AppState>, input_file: String) -> Resul
 
 // Command: Get supported formats
 #[tauri::command]
-async fn get_supported_formats() -> Result<SupportedFormats, String> {
+async fn get_supported_formats() -> Result<SupportedFormats, AppError> {
     Ok(SupportedFormats {
         video: VIDEO_FORMATS.iter().map(|s| s.to_string()).collect(),
         audio: AUDIO_FORMATS.iter().map(|s| s.to_string()).collect(),
@@ -552,13 +533,13 @@ async fn get_supported_formats() -> Result<SupportedFormats, String> {
 
 // Command: Get Adobe/After Effects presets
 #[tauri::command]
-async fn get_adobe_presets_list() -> Result<Vec<AdobePreset>, String> {
+async fn get_adobe_presets_list() -> Result<Vec<AdobePreset>, AppError> {
     Ok(get_adobe_presets())
 }
 
 // Command: Get format info
 #[tauri::command]
-async fn get_format_information(extension: String) -> Result<serde_json::Value, String> {
+async fn get_format_information(extension: String) -> Result<serde_json::Value, AppError> {
     let info = get_format_info(&extension);
     
     Ok(serde_json::json!({
@@ -572,18 +553,18 @@ async fn get_format_information(extension: String) -> Result<serde_json::Value, 
 
 // Command: Check if encoder is available
 #[tauri::command]
-async fn check_encoder_available(state: State<'_, AppState>, encoder: String) -> Result<bool, String> {
+async fn check_encoder_available(state: State<'_, AppState>, encoder: String) -> Result<bool, AppError> {
     let ffmpeg_path = get_ffmpeg_path(&state).await?;
     Ok(gpu::is_encoder_available(&ffmpeg_path.to_string_lossy(), &encoder).await)
 }
 
 // Command: Open file location in file explorer
 #[tauri::command]
-async fn open_file_location(file_path: String) -> Result<(), String> {
+async fn open_file_location(file_path: String) -> Result<(), AppError> {
     let path = std::path::Path::new(&file_path);
 
     if !path.exists() {
-        return Err(format!("File not found: {}", file_path));
+        return Err(AppError::Io(format!("File not found: {}", file_path)));
     }
 
     #[cfg(target_os = "windows")]
@@ -592,7 +573,7 @@ async fn open_file_location(file_path: String) -> Result<(), String> {
         Command::new("explorer")
             .args(["/select,", &file_path])
             .spawn()
-            .map_err(|e| format!("Failed to open file location: {}", e))?;
+            .map_err(|e| AppError::Internal(format!("Failed to open file location: {}", e)))?;
     }
 
     #[cfg(target_os = "macos")]
@@ -601,7 +582,7 @@ async fn open_file_location(file_path: String) -> Result<(), String> {
         Command::new("open")
             .args(["-R", &file_path])
             .spawn()
-            .map_err(|e| format!("Failed to open file location: {}", e))?;
+            .map_err(|e| AppError::Internal(format!("Failed to open file location: {}", e)))?;
     }
 
     #[cfg(target_os = "linux")]
@@ -612,11 +593,21 @@ async fn open_file_location(file_path: String) -> Result<(), String> {
             Command::new("xdg-open")
                 .arg(parent)
                 .spawn()
-                .map_err(|e| format!("Failed to open file location: {}", e))?;
+                .map_err(|e| AppError::Internal(format!("Failed to open file location: {}", e)))?;
         }
     }
 
     Ok(())
+}
+
+#[tauri::command]
+fn log_message(level: String, message: String) {
+    match level.as_str() {
+        "info" => info!("{}", message),
+        "warn" => log::warn!("{}", message),
+        "error" => error!("{}", message),
+        _ => info!("{}", message),
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -626,10 +617,24 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_store::Builder::new().build())
-        .setup(|_app| {
+        .setup(|app| {
+            // Initialize logging
+            if let Err(e) = logger::init_logging(&app.handle()) {
+                eprintln!("Failed to initialize logger: {}", e);
+            }
+
+            // Set up panic hook
+            let app_handle = app.handle().clone();
+            std::panic::set_hook(Box::new(move |panic_info| {
+                let payload = panic_info.payload().downcast_ref::<&str>().unwrap_or(&"");
+                let location = panic_info.location().map(|l| l.to_string()).unwrap_or_else(|| "".to_string());
+                error!("Panic occurred: payload='{}', location='{}'", payload, location);
+                let _ = app_handle.emit("panic", (payload, location));
+            }));
+
             // Ensure default output directory is created on app startup
             if let Err(e) = get_default_output_dir() {
-                eprintln!("Warning: Failed to create default output directory: {}", e);
+                error!("Warning: Failed to create default output directory: {}", e);
             }
             Ok(())
         })
@@ -659,6 +664,9 @@ pub fn run() {
             check_encoder_available,
             get_default_output_dir,
             open_file_location,
+            get_log_file_path,
+            get_log_file_content,
+            log_message,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

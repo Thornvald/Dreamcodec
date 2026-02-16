@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import StarBackground from "./components/StarBackground";
@@ -221,6 +222,7 @@ export default function App() {
   const [draggedFileCount, setDraggedFileCount] = useState(0);
   const conversionsRef = useRef<ConversionItem[]>([]);
   const pollerRef = useRef<number | null>(null);
+  const [panicInfo, setPanicInfo] = useState<{ payload: string, location: string } | null>(null);
 
   useEffect(() => {
     conversionsRef.current = conversions;
@@ -251,10 +253,28 @@ export default function App() {
     writePreferenceCache({ maxConcurrent });
   }, [maxConcurrent]);
 
-  const addLog = (message: string) => {
-    const timestamp = new Date().toLocaleTimeString();
-    setLogs(prev => [...prev, `${timestamp} - ${message}`]);
+  const addLog = (level: "info" | "warn" | "error", message: string) => {
+    invoke("log_message", { level, message });
   };
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      invoke<string>("get_log_file_content")
+        .then(content => {
+          setLogs(content.split("\n"));
+        })
+        .catch(console.error);
+    }, 2000);
+
+    const unlisten = listen("panic", (event) => {
+      setPanicInfo(event.payload as { payload: string, location: string });
+    });
+
+    return () => {
+      clearInterval(interval);
+      unlisten.then(f => f());
+    };
+  }, []);
 
   const removeConversion = (id: string) => {
     setConversions(prev => prev.filter(c => c.id !== id));
@@ -267,10 +287,10 @@ export default function App() {
   const cancelConversion = async (id: string) => {
     try {
       await invoke("cancel_conversion", { taskId: id });
-      addLog(`Cancelled: ${getFileName(conversions.find(c => c.id === id)?.inputFile || "")}`);
+      addLog("info", `Cancelled: ${getFileName(conversions.find(c => c.id === id)?.inputFile || "")}`);
     } catch (err) {
       console.error("Failed to cancel conversion:", err);
-      addLog(`Failed to cancel conversion: ${err}`);
+      addLog("error", `Failed to cancel conversion: ${err}`);
     }
   };
 
@@ -281,7 +301,7 @@ export default function App() {
     };
     setQueue(prev => [...prev, file]);
     removeConversion(conversion.id);
-    addLog(`Added back to queue: ${file.name}`);
+    addLog("info", `Added back to queue: ${file.name}`);
   };
 
   const openFileLocation = async (filePath: string) => {
@@ -289,7 +309,7 @@ export default function App() {
       await invoke("open_file_location", { filePath });
     } catch (err) {
       console.error("Failed to open file location:", err);
-      addLog(`Failed to open file location: ${err}`);
+      addLog("error", `Failed to open file location: ${err}`);
     }
   };
 
@@ -423,7 +443,7 @@ export default function App() {
     });
     const skippedCount = uniquePaths.length - validPaths.length;
     if (skippedCount > 0) {
-      addLog(`Skipped ${skippedCount} unsupported file(s).`);
+      addLog("warn", `Skipped ${skippedCount} unsupported file(s).`);
     }
     if (validPaths.length === 0) return;
 
@@ -586,12 +606,12 @@ export default function App() {
 
         if (conversion.status !== next.status) {
           if (next.status === "completed") {
-            addLog(`Completed: ${getFileName(conversion.inputFile)}`);
+            addLog("info", `Completed: ${getFileName(conversion.inputFile)}`);
           } else if (next.status === "failed") {
             const details = update.failureMessage ? ` (${update.failureMessage})` : "";
-            addLog(`Failed: ${getFileName(conversion.inputFile)}${details}`);
+            addLog("error", `Failed: ${getFileName(conversion.inputFile)}${details}`);
           } else if (next.status === "cancelled") {
-            addLog(`Cancelled: ${getFileName(conversion.inputFile)}`);
+            addLog("info", `Cancelled: ${getFileName(conversion.inputFile)}`);
           }
         }
 
@@ -658,10 +678,10 @@ export default function App() {
         setAllEncoders(cached.gpuInfo.available_encoders);
         setIsHardwareInitializing(false);
         setHardwareInitError(null);
-        addLog("Loaded cached hardware profile. Refreshing in background...");
+        addLog("info", "Loaded cached hardware profile. Refreshing in background...");
       } else {
         setIsHardwareInitializing(true);
-        addLog("Detecting CPU, GPUs, and encoders...");
+        addLog("info", "Detecting CPU, GPUs, and encoders...");
       }
 
       setHardwareInitError(null);
@@ -674,7 +694,7 @@ export default function App() {
         .then((info) => {
           latestCpuInfo = info;
           setCpuInfo(info);
-          addLog(`CPU: ${info.name} (${info.logical_cores} logical cores)`);
+          addLog("info", `CPU: ${info.name} (${info.logical_cores} logical cores)`);
           if (latestGpuInfo) {
             writeHardwareCache(info, latestGpuInfo);
           }
@@ -684,7 +704,7 @@ export default function App() {
           if (!cached) {
             setCpuInfo(null);
           }
-          addLog(`CPU detection failed: ${String(err)}`);
+          addLog("error", `CPU detection failed: ${String(err)}`);
         });
 
       try {
@@ -699,13 +719,14 @@ export default function App() {
         writeHardwareCache(latestCpuInfo, info);
 
         if (info.adapters.length === 0) {
-          addLog("GPU: no physical adapters detected");
+          addLog("info", "GPU: no physical adapters detected");
         } else {
-          addLog(`GPU adapters detected: ${info.adapters.length}`);
+          addLog("info", `GPU adapters detected: ${info.adapters.length}`);
           for (const adapter of info.adapters) {
             const primarySuffix =
               info.primary_adapter_id === adapter.id ? " [primary]" : "";
             addLog(
+              "info",
               `GPU ${adapter.id}: ${adapter.name} (${getGpuTypeLabel(adapter.gpu_type)})${primarySuffix}`
             );
           }
@@ -721,10 +742,10 @@ export default function App() {
           setAllEncoders([]);
           setHardwareInitError(String(err));
         }
-        addLog(`GPU detection failed: ${String(err)}`);
+        addLog("error", `GPU detection failed: ${String(err)}`);
       } finally {
         setIsHardwareInitializing(false);
-        addLog("Hardware detection completed.");
+        addLog("info", "Hardware detection completed.");
       }
 
       void cpuTask;
@@ -803,7 +824,7 @@ export default function App() {
 
         if (payload.paths.length > 0) {
           addFilesToQueue(payload.paths);
-          addLog(`Added ${payload.paths.length} file(s) via drag and drop.`);
+          addLog("info", `Added ${payload.paths.length} file(s) via drag and drop.`);
         }
       }
     }).then((fn) => {
@@ -813,7 +834,7 @@ export default function App() {
       }
       unlisten = fn;
     }).catch((err) => {
-      addLog(`Drag and drop initialization failed: ${String(err)}`);
+      addLog("error", `Drag and drop initialization failed: ${String(err)}`);
     });
 
     return () => {
@@ -854,7 +875,7 @@ export default function App() {
       });
       return taskId;
     } catch (err) {
-      addLog(`Failed to start: ${getFileName(item.inputFile)} (${String(err)})`);
+      addLog("error", `Failed to start: ${getFileName(item.inputFile)} (${String(err)})`);
       return null;
     }
   };
@@ -882,12 +903,12 @@ export default function App() {
 
   const handleStartConversion = async () => {
     if (isHardwareInitializing) {
-      addLog("Please wait for hardware detection to finish.");
+      addLog("warn", "Please wait for hardware detection to finish.");
       return;
     }
 
     if (queue.length === 0) {
-      addLog("Queue is empty.");
+      addLog("warn", "Queue is empty.");
       return;
     }
 
@@ -908,41 +929,41 @@ export default function App() {
       const status = await invoke<FfmpegStatus>("check_ffmpeg");
       ffmpegReady = status.available;
       if (!ffmpegReady) {
-        addLog("FFmpeg not found. Downloading...");
+        addLog("warn", "FFmpeg not found. Downloading...");
         await invoke<string>("download_ffmpeg");
         ffmpegReady = true;
-        addLog("FFmpeg downloaded.");
+        addLog("info", "FFmpeg downloaded.");
       }
     } catch (err) {
-      addLog(`FFmpeg check failed: ${String(err)}`);
+      addLog("error", `FFmpeg check failed: ${String(err)}`);
     }
 
     if (!ffmpegReady) {
-      addLog("Cannot start conversions without FFmpeg.");
+      addLog("error", "Cannot start conversions without FFmpeg.");
       return;
     }
 
     const encoderInfo = encoders.find(e => e.name === selectedEncoder);
     if (encoderInfo) {
-      addLog(`Encoder: ${encoderInfo.description} (${getEncoderType(encoderInfo)})`);
+      addLog("info", `Encoder: ${encoderInfo.description} (${getEncoderType(encoderInfo)})`);
     }
     if (selectedGpuOption) {
-      addLog(`GPU preference: ${selectedGpuOption.label}`);
+      addLog("info", `GPU preference: ${selectedGpuOption.label}`);
     }
     if (typeof gpuIndex === "number") {
       const nvidiaAdapters = gpuInfo?.adapters.filter(a => a.gpu_type === "Nvidia") ?? [];
       const gpuLabel = nvidiaAdapters[gpuIndex]?.name ?? `NVIDIA device ${gpuIndex}`;
-      addLog(`NVENC GPU: ${gpuLabel} (device ${gpuIndex})`);
+      addLog("info", `NVENC GPU: ${gpuLabel} (device ${gpuIndex})`);
     }
     if (outputFormat) {
-      addLog(`Output format: ${outputFormat.toUpperCase()}`);
+      addLog("info", `Output format: ${outputFormat.toUpperCase()}`);
     }
     if (cpuThreads) {
-      addLog(`CPU limit: ${cpuLimit}% (${cpuThreads} threads)`);
+      addLog("info", `CPU limit: ${cpuLimit}% (${cpuThreads} threads)`);
     }
-    addLog(`Max concurrent: ${maxConcurrent}`);
+    addLog("info", `Max concurrent: ${maxConcurrent}`);
 
-    addLog(`Starting ${queue.length} conversion(s)...`);
+    addLog("info", `Starting ${queue.length} conversion(s)...`);
     setActiveTab("progress");
 
     let resolvedOutputDir = outputDir;
@@ -951,16 +972,16 @@ export default function App() {
         const autoOutputDir = await invoke<string>("get_default_output_dir");
         resolvedOutputDir = autoOutputDir;
         setOutputDir(autoOutputDir);
-        addLog(`Using default output directory: ${autoOutputDir}`);
+        addLog("info", `Using default output directory: ${autoOutputDir}`);
       } catch (err) {
-        addLog(`Failed to resolve default output directory: ${String(err)}`);
+        addLog("error", `Failed to resolve default output directory: ${String(err)}`);
       }
     }
 
     if (!resolvedOutputDir) {
       const message = "No output directory available. Please select one in Settings.";
       setErrorMessage(message);
-      addLog(message);
+      addLog("error", message);
       setActiveTab("queue");
       return;
     }
@@ -1219,6 +1240,12 @@ export default function App() {
             </div>
 
             <div className="tab-content">
+              {panicInfo && (
+                <div className="error-banner error-banner-wide">
+                  <i className="ri-error-warning-fill"></i>
+                  <span>A critical error occurred: {panicInfo.payload} at {panicInfo.location}</span>
+                </div>
+              )}
               {errorMessage && (
                 <div className="error-banner error-banner-wide">
                   <i className="ri-error-warning-fill"></i>
@@ -1372,26 +1399,6 @@ export default function App() {
 
               {activeTab === "logs" && (
                 <div className="logs-panel">
-                  <div className="log-entry"><i className="ri-checkbox-circle-fill"></i> Application started</div>
-                  <div className="log-entry">
-                    <i className="ri-cpu-fill"></i> CPU:{" "}
-                    <span className={cpuInfo ? "status-success" : "status-error"}>
-                      {cpuInfo ? `${cpuInfo.name} (${cpuInfo.logical_cores} logical cores)` : "No CPU info"}
-                    </span>
-                  </div>
-                  <div className="log-entry">
-                    <i className="ri-dashboard-fill"></i> GPU detected: <span className={gpuName ? "status-success" : "status-error"}>{gpuName || "No GPU detected"}</span>
-                  </div>
-                  {gpuInfo?.adapters.map((adapter) => (
-                    <div key={adapter.id} className="log-entry">
-                      <i className="ri-cpu-line"></i> Adapter {adapter.id}:{" "}
-                      <span className="status-success">
-                        {adapter.name} ({getGpuTypeLabel(adapter.gpu_type)})
-                        {gpuInfo.primary_adapter_id === adapter.id ? " [primary]" : ""}
-                      </span>
-                    </div>
-                  ))}
-                  <div className="log-entry"><i className="ri-list-check"></i> Encoders available: {encoders.length}</div>
                   {logs.map((entry, index) => (
                     <div key={`${entry}-${index}`} className="log-entry">{entry}</div>
                   ))}

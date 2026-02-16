@@ -1,18 +1,18 @@
+use crate::error::AppError;
+use futures::StreamExt;
+use log::{debug, error, info, warn};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::path::{Path, PathBuf};
-use tokio::process::{Child, Command};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use regex::Regex;
 use tokio::fs;
-
-use futures::StreamExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-
 
 // Windows creation flags
 #[cfg(target_os = "windows")]
@@ -21,7 +21,9 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
 
 // Supported video formats
-pub const VIDEO_FORMATS: &[&str] = &["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ogv"];
+pub const VIDEO_FORMATS: &[&str] = &[
+    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ogv",
+];
 
 // Supported audio formats
 pub const AUDIO_FORMATS: &[&str] = &["mp3", "wav", "aac", "flac", "m4a", "ogg"];
@@ -32,108 +34,119 @@ pub struct FfmpegLocator;
 impl FfmpegLocator {
     /// Find FFmpeg executable using multiple search strategies
     pub async fn find_ffmpeg() -> Option<PathBuf> {
-        println!("=== FfmpegLocator::find_ffmpeg() ===");
+        info!("=== FfmpegLocator::find_ffmpeg() ===");
 
         // 1. Check bundled with app (same directory as executable)
-        println!("Checking for bundled FFmpeg...");
+        debug!("Checking for bundled FFmpeg...");
         if let Some(path) = Self::find_bundled_ffmpeg() {
-            println!("Found bundled FFmpeg at: {:?}", path);
+            debug!("Found bundled FFmpeg at: {:?}", path);
             if Self::verify_ffmpeg(&path).await {
-                println!("Bundled FFmpeg verified successfully!");
+                info!("Bundled FFmpeg verified successfully!");
                 return Some(path);
             } else {
-                println!("Bundled FFmpeg verification failed");
+                warn!("Bundled FFmpeg verification failed");
             }
         } else {
-            println!("No bundled FFmpeg found");
+            debug!("No bundled FFmpeg found");
         }
 
         // 2. Check system PATH
-        println!("Checking system PATH...");
+        debug!("Checking system PATH...");
         if let Some(path) = Self::find_in_path().await {
-            println!("Found FFmpeg in PATH: {:?}", path);
+            debug!("Found FFmpeg in PATH: {:?}", path);
             if Self::verify_ffmpeg(&path).await {
-                println!("PATH FFmpeg verified successfully!");
+                info!("PATH FFmpeg verified successfully!");
                 return Some(path);
             }
         }
 
         // 3. Check common install locations
-        println!("Checking common locations...");
+        debug!("Checking common locations...");
         if let Some(path) = Self::find_in_common_locations().await {
-            println!("Found FFmpeg in common location: {:?}", path);
+            debug!("Found FFmpeg in common location: {:?}", path);
             if Self::verify_ffmpeg(&path).await {
                 return Some(path);
             }
         }
 
         // 4. Check Windows Package Manager (WinGet) locations
-        println!("Checking WinGet locations...");
+        debug!("Checking WinGet locations...");
         if let Some(path) = Self::find_in_winget_locations().await {
-            println!("Found FFmpeg in WinGet location: {:?}", path);
+            debug!("Found FFmpeg in WinGet location: {:?}", path);
             if Self::verify_ffmpeg(&path).await {
                 return Some(path);
             }
         }
 
         // 5. Check app's data directory (downloaded FFmpeg)
-        println!("Checking app data directory...");
+        debug!("Checking app data directory...");
         if let Some(path) = Self::find_in_app_data().await {
-            println!("Found FFmpeg in app data: {:?}", path);
+            debug!("Found FFmpeg in app data: {:?}", path);
             if Self::verify_ffmpeg(&path).await {
                 return Some(path);
             }
         }
 
-        println!("FFmpeg not found in any location");
+        warn!("FFmpeg not found in any location");
         None
     }
 
     /// Check for FFmpeg bundled with the app (same directory as executable)
     fn find_bundled_ffmpeg() -> Option<PathBuf> {
         if let Ok(exe_path) = std::env::current_exe() {
-            println!("  Current exe path: {:?}", exe_path);
+            debug!("  Current exe path: {:?}", exe_path);
             if let Some(exe_dir) = exe_path.parent() {
-                println!("  Exe directory: {:?}", exe_dir);
+                debug!("  Exe directory: {:?}", exe_dir);
                 let bundled = exe_dir.join("ffmpeg.exe");
-                println!("  Looking for bundled FFmpeg at: {:?}", bundled);
-                println!("  Exists: {}", bundled.exists());
+                debug!("  Looking for bundled FFmpeg at: {:?}", bundled);
+                debug!("  Exists: {}", bundled.exists());
                 if bundled.exists() {
                     return Some(bundled);
                 }
 
                 let sidecar = exe_dir.join("ffmpeg-x86_64-pc-windows-msvc.exe");
-                println!("  Looking for bundled FFmpeg sidecar at: {:?}", sidecar);
-                println!("  Exists: {}", sidecar.exists());
+                debug!(
+                    "  Looking for bundled FFmpeg sidecar at: {:?}",
+                    sidecar
+                );
+                debug!("  Exists: {}", sidecar.exists());
                 if sidecar.exists() {
                     return Some(sidecar);
                 }
 
                 if let Some(project_dir) = exe_dir.parent().and_then(|p| p.parent()) {
                     let dev_sidecar = project_dir.join("ffmpeg-x86_64-pc-windows-msvc.exe");
-                    println!("  Looking for dev FFmpeg sidecar at: {:?}", dev_sidecar);
-                    println!("  Exists: {}", dev_sidecar.exists());
+                    debug!(
+                        "  Looking for dev FFmpeg sidecar at: {:?}",
+                        dev_sidecar
+                    );
+                    debug!("  Exists: {}", dev_sidecar.exists());
                     if dev_sidecar.exists() {
                         return Some(dev_sidecar);
                     }
 
                     let dev_ffmpeg = project_dir.join("ffmpeg.exe");
-                    println!("  Looking for dev FFmpeg at: {:?}", dev_ffmpeg);
-                    println!("  Exists: {}", dev_ffmpeg.exists());
+                    debug!("  Looking for dev FFmpeg at: {:?}", dev_ffmpeg);
+                    debug!("  Exists: {}", dev_ffmpeg.exists());
                     if dev_ffmpeg.exists() {
                         return Some(dev_ffmpeg);
                     }
 
-                    let bin_sidecar = project_dir.join("bin").join("ffmpeg-x86_64-pc-windows-msvc.exe");
-                    println!("  Looking for bin FFmpeg sidecar at: {:?}", bin_sidecar);
-                    println!("  Exists: {}", bin_sidecar.exists());
+                    let bin_sidecar = project_dir
+                        .join("bin")
+                        .join("ffmpeg-x86_64-pc-windows-msvc.exe");
+                    debug!(
+                        "  Looking for bin FFmpeg sidecar at: {:?}",
+                        bin_sidecar
+                    );
+                    debug!("  Exists: {}", bin_sidecar.exists());
                     if bin_sidecar.exists() {
                         return Some(bin_sidecar);
                     }
 
                     let bin_ffmpeg = project_dir.join("bin").join("ffmpeg.exe");
-                    println!("  Looking for bin FFmpeg at: {:?}", bin_ffmpeg);
-                    println!("  Exists: {}", bin_ffmpeg.exists());
+                    debug!("  Looking for bin FFmpeg at: {:?}", bin_ffmpeg);
+                    debug!("  Exists: {}", bin_ffmpeg.exists());
                     if bin_ffmpeg.exists() {
                         return Some(bin_ffmpeg);
                     }
@@ -231,8 +244,11 @@ impl FfmpegLocator {
     /// Check Windows Package Manager (WinGet) locations
     async fn find_in_winget_locations() -> Option<PathBuf> {
         if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            let winget_base = PathBuf::from(local_app_data).join("Microsoft").join("WinGet").join("Packages");
-            
+            let winget_base = PathBuf::from(local_app_data)
+                .join("Microsoft")
+                .join("WinGet")
+                .join("Packages");
+
             if winget_base.exists() {
                 // Search for ffmpeg in WinGet packages
                 if let Ok(entries) = std::fs::read_dir(&winget_base) {
@@ -246,13 +262,13 @@ impl FfmpegLocator {
                                         entry.path().join("ffmpeg.exe"),
                                         entry.path().join("bin").join("ffmpeg.exe"),
                                     ];
-                                    
+
                                     for path in &possible_paths {
                                         if path.exists() {
                                             return Some(path.clone());
                                         }
                                     }
-                                    
+
                                     // Recursively search one level deep
                                     if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
                                         for sub_entry in sub_entries.flatten() {
@@ -460,7 +476,8 @@ pub fn get_adobe_presets() -> Vec<AdobePreset> {
         },
         AdobePreset {
             name: "prores_422_hq".to_string(),
-            description: "Apple ProRes 422 HQ (Highest Quality for Premiere Pro / Final Cut)".to_string(),
+            description: "Apple ProRes 422 HQ (Highest Quality for Premiere Pro / Final Cut)"
+                .to_string(),
             encoder: "prores_ks".to_string(),
             encoder_options: vec!["-profile:v".to_string(), "3".to_string()],
             pixel_format: "yuv422p10le".to_string(),
@@ -469,7 +486,12 @@ pub fn get_adobe_presets() -> Vec<AdobePreset> {
             name: "prores_4444".to_string(),
             description: "Apple ProRes 4444 (With Alpha Channel)".to_string(),
             encoder: "prores_ks".to_string(),
-            encoder_options: vec!["-profile:v".to_string(), "4".to_string(), "-alpha_bits".to_string(), "16".to_string()],
+            encoder_options: vec![
+                "-profile:v".to_string(),
+                "4".to_string(),
+                "-alpha_bits".to_string(),
+                "16".to_string(),
+            ],
             pixel_format: "yuva444p10le".to_string(),
         },
         AdobePreset {
@@ -558,7 +580,7 @@ pub struct StreamInfo {
 }
 
 impl VideoInfo {
-    pub fn parse(ffmpeg_output: &str) -> Result<Self, String> {
+    pub fn parse(ffmpeg_output: &str) -> Result<Self, AppError> {
         let mut duration = None;
         let mut width = None;
         let mut height = None;
@@ -566,19 +588,19 @@ impl VideoInfo {
         let mut audio_streams = Vec::new();
 
         // Parse duration
-        let duration_regex = Regex::new(r"Duration: (\d+):(\d+):(\d+\.\d+)").unwrap();
+        let duration_regex = Regex::new(r"Duration: (\d+):(\d+):(\d+\.\d+)")
+            .map_err(|e| AppError::Internal(e.to_string()))?;
         if let Some(captures) = duration_regex.captures(ffmpeg_output) {
-            let hours: f64 = captures[1].parse().unwrap_or(0.0);
-            let minutes: f64 = captures[2].parse().unwrap_or(0.0);
-            let seconds: f64 = captures[3].parse().unwrap_or(0.0);
+            let hours: f64 = captures[1].parse::<f64>().unwrap_or(0.0);
+            let minutes: f64 = captures[2].parse::<f64>().unwrap_or(0.0);
+            let seconds: f64 = captures[3].parse::<f64>().unwrap_or(0.0);
             duration = Some(hours * 3600.0 + minutes * 60.0 + seconds);
         }
 
         // Parse streams (handles optional [0x..] and (lang) segments)
-        let stream_regex = Regex::new(
-            r"Stream #0:(\d+)(?:\[[^\]]+\])?(?:\(([^\)]+)\))?: (Video|Audio): ([^,\s]+)",
-        )
-        .unwrap();
+        let stream_regex =
+            Regex::new(r"Stream #0:(\d+)(?:\[[^\]]+\])?(?:\(([^\)]+)\))?: (Video|Audio): ([^,\s]+)")
+                .map_err(|e| AppError::Internal(e.to_string()))?;
         for caps in stream_regex.captures_iter(ffmpeg_output) {
             let index: u32 = caps[1].parse().unwrap_or(0);
             let language = caps.get(2).map(|m| m.as_str().to_string());
@@ -595,7 +617,8 @@ impl VideoInfo {
             match stream_type {
                 "Video" => {
                     // Parse resolution from the same line
-                    let resolution_regex = Regex::new(r"(\d+)x(\d+)").unwrap();
+                    let resolution_regex = Regex::new(r"(\d+)x(\d+)")
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
                     if let Some(res_caps) = resolution_regex.captures(&caps[0]) {
                         width = Some(res_caps[1].parse().unwrap_or(0));
                         height = Some(res_caps[2].parse().unwrap_or(0));
@@ -675,7 +698,7 @@ impl FfmpegManager {
         cpu_threads: Option<u32>,
         preset: String,
         is_adobe_preset: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), AppError> {
         let duration = 0.0;
 
         let adobe_preset = if is_adobe_preset {
@@ -727,7 +750,7 @@ impl FfmpegManager {
         })
     }
 
-    pub fn cancel_conversion(&mut self, task_id: &str) -> Result<(), String> {
+    pub fn cancel_conversion(&mut self, task_id: &str) -> Result<(), AppError> {
         if let Some(task_arc) = self.tasks.get(task_id) {
             // Use try_lock to avoid blocking if task is being processed
             if let Ok(mut task) = task_arc.try_lock() {
@@ -751,7 +774,7 @@ impl FfmpegManager {
                 Ok(())
             }
         } else {
-            Err("Task not found".to_string())
+            Err(AppError::Internal("Task not found".to_string()))
         }
     }
 
@@ -806,15 +829,27 @@ fn translate_nvenc_preset(cpu_preset: &str) -> String {
         // Slow presets - map to NVENC's slowest (best quality)
         "slow" | "slower" | "veryslow" => "slow".to_string(),
         // If it's already a valid NVENC preset, pass it through
-        "default" | "hp" | "hq" | "bd" | "ll" | "llhq" | "llhp" | "lossless" | "losslesshp" => cpu_preset.to_string(),
+        "default" | "hp" | "hq" | "bd" | "ll" | "llhq" | "llhp" | "lossless" | "losslesshp" => {
+            cpu_preset.to_string()
+        }
         // Fallback for any unknown preset
         _ => "medium".to_string(),
     }
 }
 
 async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
-    let (input_file, output_file, ffmpeg_path, encoder, gpu_index, cpu_threads, preset, is_adobe_preset, adobe_preset) = {
-        let task = task_arc.lock().unwrap();
+    let (
+        input_file,
+        output_file,
+        ffmpeg_path,
+        encoder,
+        gpu_index,
+        cpu_threads,
+        preset,
+        is_adobe_preset,
+        adobe_preset,
+    ) = {
+        let task = task_arc.lock().expect("Failed to lock task mutex");
         (
             task.input_file.clone(),
             task.output_file.clone(),
@@ -839,17 +874,12 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
     let is_amf = encoder.contains("amf");
     let is_qsv = encoder.contains("qsv");
     let is_gpu_encoder = is_nvenc || is_amf || is_qsv;
-    // For GPU encoders we try up to 3 strategies:
-    //   0 — hardware decode + GPU encode (best performance)
-    //   1 — software decode + GPU encode (decode compatibility)
-    //   2 — software decode + GPU encode + forced nv12 pixel format (max compatibility)
     let max_attempts: usize = if is_gpu_encoder { 3 } else { 1 };
 
     for attempt in 0..max_attempts {
         let use_hw_decode = is_gpu_encoder && attempt == 0;
         let force_nv12 = is_gpu_encoder && attempt == 2;
 
-        // Build FFmpeg command
         let mut args = vec![
             "-y".to_string(),
             "-hide_banner".to_string(),
@@ -858,27 +888,19 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
             "-nostats".to_string(),
         ];
 
-        // Hardware-accelerated decode on the first attempt for GPU encoders.
-        // NOTE: We intentionally omit -hwaccel_output_format so that FFmpeg
-        // can perform pixel-format conversion (e.g. 10-bit HEVC → 8-bit NV12)
-        // between decode and encode.  This fixes iPhone MOV/HEVC files that would
-        // otherwise fail due to incompatible pixel formats in GPU memory.
         if use_hw_decode {
             args.push("-hwaccel".to_string());
             if is_nvenc {
-                // NVIDIA: use CUDA specifically
                 args.push("cuda".to_string());
                 if let Some(index) = gpu_index {
                     args.push("-hwaccel_device".to_string());
                     args.push(index.to_string());
                 }
             } else {
-                // AMD/Intel: let FFmpeg pick the best available (D3D11VA, VAAPI, etc.)
                 args.push("auto".to_string());
             }
         }
 
-        // Limit CPU threads when configured
         if let Some(threads) = cpu_threads {
             args.push("-threads".to_string());
             args.push(threads.to_string());
@@ -887,7 +909,6 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
         args.push("-i".to_string());
         args.push(input_file.clone());
 
-        // Add stream mapping for video formats
         if format_info.supports_video {
             args.push("-map".to_string());
             args.push("0:v?".to_string());
@@ -897,41 +918,28 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
             if format_info.supports_video {
                 args.push("0:a?".to_string());
             } else {
-                // Audio-only outputs should only include the first audio stream.
                 args.push("0:a:0?".to_string());
             }
         }
 
         if is_adobe_preset {
-            // Adobe preset handling
             if let Some(ref preset_config) = adobe_preset {
                 args.push("-c:v".to_string());
                 args.push(preset_config.encoder.clone());
-
-                // Add encoder options
-                for opt in &preset_config.encoder_options {
-                    args.push(opt.clone());
-                }
-
+                args.extend(preset_config.encoder_options.iter().cloned());
                 args.push("-pix_fmt".to_string());
                 args.push(preset_config.pixel_format.clone());
-
-                // For ProRes and DNxHD, audio should be PCM or AAC
                 if preset_config.encoder == "prores_ks" || preset_config.encoder == "dnxhd" {
                     args.push("-c:a".to_string());
                     args.push("pcm_s16le".to_string());
                 }
             }
         } else {
-            // Standard encoder handling
             if format_info.supports_video {
                 args.push("-c:v".to_string());
                 args.push(encoder.clone());
-
-                // Add preset for compatible encoders
                 if is_nvenc || encoder == "libx264" || encoder == "libx265" {
                     args.push("-preset".to_string());
-                    // NVENC only supports a limited set of presets - translate CPU presets to NVENC equivalents
                     let preset_value = if is_nvenc {
                         translate_nvenc_preset(&preset)
                     } else {
@@ -939,27 +947,17 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
                     };
                     args.push(preset_value);
                 }
-
-                // Select specific NVIDIA GPU for NVENC
                 if is_nvenc {
                     if let Some(index) = gpu_index {
                         args.push("-gpu".to_string());
                         args.push(index.to_string());
                     }
                 }
-
-                // On the last retry, force NV12 pixel format for GPU encoders.
-                // This handles inputs with incompatible pixel formats (e.g. 10-bit
-                // HEVC from iPhone MOV) that the encoder cannot auto-negotiate.
-                // We only do this as a fallback because explicitly setting -pix_fmt
-                // can conflict with hardware acceleration pipelines.
                 if force_nv12 {
                     args.push("-pix_fmt".to_string());
                     args.push("nv12".to_string());
                 }
             }
-
-            // Audio codec
             if format_info.supports_audio {
                 args.push("-c:a".to_string());
                 if format_info.default_audio_codec.is_empty() {
@@ -972,50 +970,36 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
 
         args.push(output_file.clone());
 
-        // Update status to running
         {
-            let mut task = task_arc.lock().unwrap();
+            let mut task = task_arc.lock().expect("Failed to lock task mutex");
             task.progress.status = ConversionStatus::Running;
-            if attempt == 1 {
-                task.progress.log.push(
-                    "Retrying with software decode + GPU encode...".to_string(),
-                );
-                task.progress.percentage = 0.0;
-                task.progress.current_time = 0.0;
-                task.progress.duration = 0.0;
-                task.progress.error_message = None;
-            } else if attempt == 2 {
-                task.progress.log.push(
-                    "Retrying with forced NV12 pixel format...".to_string(),
-                );
-                task.progress.percentage = 0.0;
-                task.progress.current_time = 0.0;
-                task.progress.duration = 0.0;
-                task.progress.error_message = None;
-            } else if is_gpu_encoder {
-                let hw_label = if is_nvenc {
-                    "NVENC + CUDA hardware decode"
-                } else if is_amf {
-                    "AMF + hardware decode"
-                } else {
-                    "QSV + hardware decode"
-                };
-                task.progress
-                    .log
-                    .push(format!("GPU encode selected: using {}.", hw_label));
-            }
-            task.progress
-                .log
-                .push(format!("FFmpeg args: {}", args.join(" ")));
+            let log_msg = match attempt {
+                1 => "Retrying with software decode + GPU encode...",
+                2 => "Retrying with forced NV12 pixel format...",
+                _ if is_gpu_encoder => {
+                    let hw_label = if is_nvenc {
+                        "NVENC + CUDA hardware decode"
+                    } else if is_amf {
+                        "AMF + hardware decode"
+                    } else {
+                        "QSV + hardware decode"
+                    };
+                    info!("GPU encode selected: using {}.", hw_label);
+                    "Starting GPU accelerated conversion."
+                }
+                _ => "Starting software conversion.",
+            };
+            task.progress.log.push(log_msg.to_string());
+            info!("{}", log_msg);
+            task.progress.log.push(format!("FFmpeg args: {}", args.join(" ")));
         }
 
-        // Run FFmpeg
-        println!("=== FFmpeg Start (attempt {}) ===", attempt + 1);
-        println!("FFmpeg path: {}", ffmpeg_path);
-        println!("Encoder: {}", encoder);
-        println!("Input: {}", input_file);
-        println!("Output: {}", output_file);
-        println!("Args: {:?}", args);
+        info!("=== FFmpeg Start (attempt {}) ===", attempt + 1);
+        info!("FFmpeg path: {}", ffmpeg_path);
+        info!("Encoder: {}", encoder);
+        info!("Input: {}", input_file);
+        info!("Output: {}", output_file);
+        debug!("Args: {:?}", args);
 
         let mut cmd = Command::new(&ffmpeg_path);
         cmd.args(&args)
@@ -1027,142 +1011,103 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
         let child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
+                error!("Failed to start ffmpeg: {}", e);
                 if attempt < max_attempts - 1 {
-                    let mut task = task_arc.lock().unwrap();
-                    task.progress.log.push(format!(
-                        "FFmpeg start failed ({}). Will retry with software decode...",
-                        e
-                    ));
+                    let mut task = task_arc.lock().expect("Failed to lock task mutex");
+                    task.progress.log.push(format!("FFmpeg start failed ({}). Will retry...", e));
                     continue;
                 }
-                let mut task = task_arc.lock().unwrap();
-                let message =
-                    format!("Failed to start ffmpeg: {} (path: {})", e, ffmpeg_path);
+                let mut task = task_arc.lock().expect("Failed to lock task mutex");
+                let message = format!("Failed to start ffmpeg: {} (path: {})", e, ffmpeg_path);
                 task.progress.status = ConversionStatus::Failed(message.clone());
                 task.progress.error_message = Some(message);
                 return;
             }
         };
 
-        // Read output
-        let time_regex = Regex::new(r"time=(\d+):(\d+):(\d+\.\d+)").unwrap();
-        let out_time_regex = Regex::new(r"out_time=(\d+):(\d+):(\d+\.\d+)").unwrap();
-        let out_time_us_regex = Regex::new(r"out_time_us=(\d+)").unwrap();
-        let out_time_ms_regex = Regex::new(r"out_time_ms=(\d+)").unwrap();
-        let duration_regex = Regex::new(r"Duration: (\d+):(\d+):(\d+\.\d+)").unwrap();
+        let time_regex = Regex::new(r"time=(\d+):(\d+):(\d+\.\d+)").expect("Invalid regex");
+        let out_time_regex = Regex::new(r"out_time=(\d+):(\d+):(\d+\.\d+)").expect("Invalid regex");
+        let out_time_us_regex = Regex::new(r"out_time_us=(\d+)").expect("Invalid regex");
+        let out_time_ms_regex = Regex::new(r"out_time_ms=(\d+)").expect("Invalid regex");
+        let duration_regex = Regex::new(r"Duration: (\d+):(\d+):(\d+\.\d+)").expect("Invalid regex");
 
         let mut process_ref = {
-            let mut task = task_arc.lock().unwrap();
+            let mut task = task_arc.lock().expect("Failed to lock task mutex");
             task.process = Some(child);
             task.pid = task.process.as_ref().and_then(|proc| proc.id());
-            task.process.take().unwrap()
+            task.process.take().expect("Child process should be present")
         };
 
-        let mut last_log_line: Option<String> = None;
+        let stderr = process_ref.stderr.take().expect("FFmpeg stderr stream not available");
+        let mut reader = BufReader::new(stderr).lines();
+        let mut full_stderr = Vec::new();
 
-        if let Some(stderr) = process_ref.stderr.take() {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            full_stderr.push(line.clone());
+            let mut task = task_arc.lock().expect("Failed to lock task mutex");
+            task.progress.log.push(line.clone());
 
-            while let Ok(Some(line)) = lines.next_line().await {
-                last_log_line = Some(line.clone());
-                let mut task = task_arc.lock().unwrap();
-                task.progress.log.push(line.clone());
-
-                // Parse duration from FFmpeg initial output
-                if task.progress.duration == 0.0 {
-                    if let Some(captures) = duration_regex.captures(&line) {
-                        let hours: f64 = captures[1].parse().unwrap_or(0.0);
-                        let minutes: f64 = captures[2].parse().unwrap_or(0.0);
-                        let seconds: f64 = captures[3].parse().unwrap_or(0.0);
-                        task.progress.duration =
-                            hours * 3600.0 + minutes * 60.0 + seconds;
-                        println!(
-                            "Parsed duration: {} seconds",
-                            task.progress.duration
-                        );
+            if task.progress.duration == 0.0 {
+                if let Some(captures) = duration_regex.captures(&line) {
+                    if let (Ok(h), Ok(m), Ok(s)) = (
+                        captures[1].parse::<f64>(),
+                        captures[2].parse::<f64>(),
+                        captures[3].parse::<f64>(),
+                    ) {
+                        let total_seconds: f64 = h * 3600.0 + m * 60.0 + s;
+                        task.progress.duration = total_seconds;
+                        debug!("Parsed duration: {} seconds", total_seconds);
                     }
                 }
+            }
+            
+            let parsed_time = if let Some(c) = time_regex.captures(&line) {
+                Some(c[1].parse::<f64>().unwrap_or(0.0) * 3600.0 + c[2].parse::<f64>().unwrap_or(0.0) * 60.0 + c[3].parse::<f64>().unwrap_or(0.0))
+            } else if let Some(c) = out_time_regex.captures(&line) {
+                Some(c[1].parse::<f64>().unwrap_or(0.0) * 3600.0 + c[2].parse::<f64>().unwrap_or(0.0) * 60.0 + c[3].parse::<f64>().unwrap_or(0.0))
+            } else if let Some(c) = out_time_us_regex.captures(&line) {
+                c[1].parse::<f64>().map(|us| us / 1_000_000.0).ok()
+            } else if let Some(c) = out_time_ms_regex.captures(&line) {
+                c[1].parse::<f64>().map(|ms| ms / 1_000_000.0).ok()
+            } else {
+                None
+            };
 
-                // Parse progress
-                let parsed_time =
-                    if let Some(captures) = time_regex.captures(&line) {
-                        let hours: f64 = captures[1].parse().unwrap_or(0.0);
-                        let minutes: f64 = captures[2].parse().unwrap_or(0.0);
-                        let seconds: f64 = captures[3].parse().unwrap_or(0.0);
-                        Some(hours * 3600.0 + minutes * 60.0 + seconds)
-                    } else if let Some(captures) = out_time_regex.captures(&line)
-                    {
-                        let hours: f64 = captures[1].parse().unwrap_or(0.0);
-                        let minutes: f64 = captures[2].parse().unwrap_or(0.0);
-                        let seconds: f64 = captures[3].parse().unwrap_or(0.0);
-                        Some(hours * 3600.0 + minutes * 60.0 + seconds)
-                    } else if let Some(captures) =
-                        out_time_us_regex.captures(&line)
-                    {
-                        let out_time_us: f64 =
-                            captures[1].parse().unwrap_or(0.0);
-                        Some(out_time_us / 1_000_000.0)
-                    } else if let Some(captures) =
-                        out_time_ms_regex.captures(&line)
-                    {
-                        let out_time_ms: f64 =
-                            captures[1].parse().unwrap_or(0.0);
-                        // Some FFmpeg builds label this key as ms while reporting microseconds.
-                        Some(out_time_ms / 1_000_000.0)
-                    } else {
-                        None
-                    };
-
-                if let Some(current_time) = parsed_time {
-                    task.progress.current_time =
-                        current_time.max(task.progress.current_time);
-                    if task.progress.duration > 0.0 {
-                        task.progress.percentage =
-                            ((task.progress.current_time / task.progress.duration)
-                                * 100.0)
-                                .min(100.0);
-                    }
+            if let Some(current_time) = parsed_time {
+                task.progress.current_time = current_time.max(task.progress.current_time);
+                if task.progress.duration > 0.0 {
+                    task.progress.percentage = (task.progress.current_time / task.progress.duration * 100.0).min(100.0);
                 }
             }
         }
 
-        // Wait for process to complete
         let status = process_ref.wait().await;
-
         let succeeded = {
-            let mut task = task_arc.lock().unwrap();
+            let mut task = task_arc.lock().expect("Failed to lock task mutex");
             task.process = None;
             task.pid = None;
             match status {
                 Ok(exit_status) if exit_status.success() => {
+                    info!("FFmpeg task completed successfully for {}", input_file);
                     task.progress.status = ConversionStatus::Completed;
                     task.progress.percentage = 100.0;
                     true
                 }
                 Ok(exit_status) => {
-                    let message = last_log_line
-                        .clone()
-                        .unwrap_or_else(|| {
-                            format!(
-                                "FFmpeg exited with code: {:?}",
-                                exit_status.code()
-                            )
-                        });
-                    task.progress.status =
-                        ConversionStatus::Failed(message.clone());
-                    if task.progress.error_message.is_none() {
-                        task.progress.error_message = Some(message);
-                    }
+                    let exit_code_str = exit_status.code().map_or("None".to_string(), |c| c.to_string());
+                    let err_msg = format!("FFmpeg exited with code: {}", exit_code_str);
+                    error!("{} for input: {}", err_msg, input_file);
+                    error!("FFmpeg command: {} {}", ffmpeg_path, args.join(" "));
+                    error!("FFmpeg stderr: \n{}", full_stderr.join("\n"));
+                    task.progress.status = ConversionStatus::Failed(err_msg.clone());
+                    task.progress.error_message = Some(err_msg);
                     false
                 }
                 Err(e) => {
-                    let message = e.to_string();
-                    task.progress.status =
-                        ConversionStatus::Failed(message.clone());
-                    if task.progress.error_message.is_none() {
-                        task.progress.error_message = Some(message);
-                    }
+                    let err_msg = format!("Failed to wait for FFmpeg process: {}", e);
+                    error!("{} for input: {}", err_msg, input_file);
+                    task.progress.status = ConversionStatus::Failed(err_msg.clone());
+                    task.progress.error_message = Some(err_msg);
                     false
                 }
             }
@@ -1172,17 +1117,9 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
             return;
         }
 
-        // If more attempts remain, clean up and retry with a different strategy
         if attempt < max_attempts - 1 {
-            {
-                let mut task = task_arc.lock().unwrap();
-                task.progress.log.push(
-                    "Conversion failed. Trying next fallback strategy..."
-                        .to_string(),
-                );
-            }
+            warn!("Conversion failed. Trying next fallback strategy for {}", input_file);
             let _ = std::fs::remove_file(&output_file);
-            continue;
         }
     }
 }
@@ -1195,19 +1132,19 @@ impl FfmpegDownloader {
         Self
     }
 
-    pub fn get_ffmpeg_app_dir() -> Result<PathBuf, String> {
+    pub fn get_ffmpeg_app_dir() -> Result<PathBuf, AppError> {
         let app_dir = dirs::data_dir()
-            .ok_or("Could not find app data directory")?
+            .ok_or_else(|| AppError::Internal("Could not find app data directory".to_string()))?
             .join("Dreamcodec");
         Ok(app_dir)
     }
 
-    pub fn get_ffmpeg_path() -> Result<PathBuf, String> {
+    pub fn get_ffmpeg_path() -> Result<PathBuf, AppError> {
         let app_dir = Self::get_ffmpeg_app_dir()?;
         Ok(app_dir.join("ffmpeg.exe"))
     }
 
-    pub fn get_ffprobe_path() -> Result<PathBuf, String> {
+    pub fn get_ffprobe_path() -> Result<PathBuf, AppError> {
         let app_dir = Self::get_ffmpeg_app_dir()?;
         Ok(app_dir.join("ffprobe.exe"))
     }
@@ -1217,7 +1154,7 @@ impl FfmpegDownloader {
         if let Some(path) = FfmpegLocator::find_ffmpeg().await {
             return path.exists();
         }
-        
+
         // Fallback to app directory check
         match Self::get_ffmpeg_path() {
             Ok(path) => path.exists(),
@@ -1225,7 +1162,7 @@ impl FfmpegDownloader {
         }
     }
 
-    pub async fn download_and_extract_ffmpeg<F>(progress_callback: F) -> Result<PathBuf, String>
+    pub async fn download_and_extract_ffmpeg<F>(progress_callback: F) -> Result<PathBuf, AppError>
     where
         F: Fn(u64, u64) + Send + 'static,
     {
@@ -1238,36 +1175,43 @@ impl FfmpegDownloader {
         }
 
         // Create directory if needed
-        fs::create_dir_all(&app_dir).await
-            .map_err(|e| format!("Failed to create app directory: {}", e))?;
+        fs::create_dir_all(&app_dir)
+            .await
+            .map_err(|e| AppError::Io(e.to_string()))?;
 
         let zip_url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
         let zip_path = app_dir.join("ffmpeg.zip");
 
         // Download the zip file with progress
         let client = reqwest::Client::new();
-        let response = client.get(zip_url)
-            .send().await
-            .map_err(|e| format!("Failed to download FFmpeg: {}", e))?;
+        let response = client
+            .get(zip_url)
+            .send()
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to download FFmpeg: {}", e)))?;
 
         let total_size = response.content_length().unwrap_or(0);
         let mut downloaded = 0u64;
 
-        let mut file = fs::File::create(&zip_path).await
-            .map_err(|e| format!("Failed to create zip file: {}", e))?;
+        let mut file = fs::File::create(&zip_path)
+            .await
+            .map_err(|e| AppError::Io(e.to_string()))?;
 
         let mut stream = response.bytes_stream();
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
-            file.write_all(&chunk).await
-                .map_err(|e| format!("Write error: {}", e))?;
+            let chunk =
+                chunk.map_err(|e| AppError::Internal(format!("Download error: {}", e)))?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| AppError::Io(e.to_string()))?;
             downloaded += chunk.len() as u64;
             progress_callback(downloaded, total_size);
         }
 
-        file.flush().await
-            .map_err(|e| format!("Failed to flush file: {}", e))?;
+        file.flush()
+            .await
+            .map_err(|e| AppError::Io(e.to_string()))?;
         drop(file);
 
         // Extract the zip file
@@ -1277,27 +1221,28 @@ impl FfmpegDownloader {
         let _ = fs::remove_file(&zip_path).await;
 
         if !ffmpeg_path.exists() {
-            return Err("FFmpeg extraction failed".to_string());
+            return Err(AppError::Ffmpeg("FFmpeg extraction failed".to_string()));
         }
 
         Ok(ffmpeg_path)
     }
 
-    async fn extract_ffmpeg(zip_path: &Path, output_dir: &Path) -> Result<(), String> {
+    async fn extract_ffmpeg(zip_path: &Path, output_dir: &Path) -> Result<(), AppError> {
         // Read and extract the zip file
-        let file = std::fs::File::open(zip_path)
-            .map_err(|e| format!("Failed to open zip file: {}", e))?;
-        
+        let file =
+            std::fs::File::open(zip_path).map_err(|e| AppError::Io(format!("Failed to open zip file: {}", e)))?;
+
         let mut archive = zip::ZipArchive::new(file)
-            .map_err(|e| format!("Failed to read zip archive: {}", e))?;
+            .map_err(|e| AppError::Internal(format!("Failed to read zip archive: {}", e)))?;
 
         // Find the ffmpeg.exe and ffprobe.exe in the archive
         let mut ffmpeg_entry_name = String::new();
         let mut ffprobe_entry_name = String::new();
 
         for i in 0..archive.len() {
-            let entry = archive.by_index(i)
-                .map_err(|e| format!("Failed to read zip entry: {}", e))?;
+            let entry = archive.by_index(i).map_err(|e| {
+                AppError::Internal(format!("Failed to read zip entry: {}", e))
+            })?;
             let name = entry.name().to_lowercase();
             if name.ends_with("ffmpeg.exe") && !name.contains("doc") {
                 ffmpeg_entry_name = entry.name().to_string();
@@ -1307,33 +1252,38 @@ impl FfmpegDownloader {
         }
 
         if ffmpeg_entry_name.is_empty() {
-            return Err("Could not find ffmpeg.exe in archive".to_string());
+            return Err(AppError::Ffmpeg(
+                "Could not find ffmpeg.exe in archive".to_string(),
+            ));
         }
 
         // Extract ffmpeg.exe
         {
-            let mut ffmpeg_file = archive.by_name(&ffmpeg_entry_name)
-                .map_err(|e| format!("Failed to find ffmpeg in archive: {}", e))?;
+            let mut ffmpeg_file = archive
+                .by_name(&ffmpeg_entry_name)
+                .map_err(|e| AppError::Internal(format!("Failed to find ffmpeg in archive: {}", e)))?;
             let out_path = output_dir.join("ffmpeg.exe");
             let mut outfile = std::fs::File::create(&out_path)
-                .map_err(|e| format!("Failed to create output file: {}", e))?;
+                .map_err(|e| AppError::Io(format!("Failed to create output file: {}", e)))?;
             std::io::copy(&mut ffmpeg_file, &mut outfile)
-                .map_err(|e| format!("Failed to extract ffmpeg: {}", e))?;
+                .map_err(|e| AppError::Io(format!("Failed to extract ffmpeg: {}", e)))?;
         }
 
         // Extract ffprobe.exe
         if !ffprobe_entry_name.is_empty() {
-            let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path)
-                .map_err(|e| format!("Failed to reopen zip: {}", e))?)
-                .map_err(|e| format!("Failed to read zip archive: {}", e))?;
-            
-            let mut ffprobe_file = archive.by_name(&ffprobe_entry_name)
-                .map_err(|e| format!("Failed to find ffprobe in archive: {}", e))?;
+            let mut archive = zip::ZipArchive::new(
+                std::fs::File::open(zip_path).map_err(|e| AppError::Io(format!("Failed to reopen zip: {}", e)))?,
+            )
+            .map_err(|e| AppError::Internal(format!("Failed to read zip archive: {}", e)))?;
+
+            let mut ffprobe_file = archive.by_name(&ffprobe_entry_name).map_err(|e| {
+                AppError::Internal(format!("Failed to find ffprobe in archive: {}", e))
+            })?;
             let out_path = output_dir.join("ffprobe.exe");
             let mut outfile = std::fs::File::create(&out_path)
-                .map_err(|e| format!("Failed to create output file: {}", e))?;
+                .map_err(|e| AppError::Io(format!("Failed to create output file: {}", e)))?;
             std::io::copy(&mut ffprobe_file, &mut outfile)
-                .map_err(|e| format!("Failed to extract ffprobe: {}", e))?;
+                .map_err(|e| AppError::Io(format!("Failed to extract ffprobe: {}", e)))?;
         }
 
         Ok(())
