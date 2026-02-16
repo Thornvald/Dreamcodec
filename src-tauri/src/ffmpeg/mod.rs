@@ -795,6 +795,23 @@ fn kill_process(pid: u32) {
     }
 }
 
+/// Translate CPU-oriented preset names to NVENC-compatible presets.
+/// NVENC only supports: default, slow, medium, fast, hp (high performance)
+fn translate_nvenc_preset(cpu_preset: &str) -> String {
+    match cpu_preset {
+        // Fast presets - map to NVENC's fastest
+        "ultrafast" | "superfast" | "veryfast" | "faster" => "fast".to_string(),
+        // Medium speed - direct mapping
+        "fast" | "medium" => "medium".to_string(),
+        // Slow presets - map to NVENC's slowest (best quality)
+        "slow" | "slower" | "veryslow" => "slow".to_string(),
+        // If it's already a valid NVENC preset, pass it through
+        "default" | "hp" | "hq" | "bd" | "ll" | "llhq" | "llhp" | "lossless" | "losslesshp" => cpu_preset.to_string(),
+        // Fallback for any unknown preset
+        _ => "medium".to_string(),
+    }
+}
+
 async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
     let (input_file, output_file, ffmpeg_path, encoder, gpu_index, cpu_threads, preset, is_adobe_preset, adobe_preset) = {
         let task = task_arc.lock().unwrap();
@@ -914,7 +931,13 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
                 // Add preset for compatible encoders
                 if is_nvenc || encoder == "libx264" || encoder == "libx265" {
                     args.push("-preset".to_string());
-                    args.push(preset.clone());
+                    // NVENC only supports a limited set of presets - translate CPU presets to NVENC equivalents
+                    let preset_value = if is_nvenc {
+                        translate_nvenc_preset(&preset)
+                    } else {
+                        preset.clone()
+                    };
+                    args.push(preset_value);
                 }
 
                 // Select specific NVIDIA GPU for NVENC
