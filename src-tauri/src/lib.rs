@@ -81,15 +81,29 @@ struct StartConversionArgs {
 }
 
 #[tauri::command]
-fn get_log_file_path(app_handle: tauri::AppHandle) -> Result<PathBuf, AppError> {
-    let log_dir = app_handle.path().app_log_dir().map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(log_dir.join(logger::LOG_FILE_NAME))
+fn get_log_file_path() -> Result<PathBuf, AppError> {
+    logger::session_log_path()
+        .cloned()
+        .ok_or_else(|| AppError::Internal("Session log not initialized".to_string()))
 }
 
 #[tauri::command]
-async fn get_log_file_content(app_handle: tauri::AppHandle) -> Result<String, AppError> {
-    let log_path = get_log_file_path(app_handle)?;
+async fn get_log_file_content() -> Result<String, AppError> {
+    let log_path = logger::session_log_path()
+        .ok_or_else(|| AppError::Internal("Session log not initialized".to_string()))?;
     tokio::fs::read_to_string(log_path).await.map_err(|e| e.into())
+}
+
+#[tauri::command]
+async fn clear_session_log() -> Result<(), AppError> {
+    let log_path = logger::session_log_path()
+        .ok_or_else(|| AppError::Internal("Session log not initialized".to_string()))?;
+    tokio::fs::write(log_path, b"").await.map_err(|e| e.into())
+}
+
+#[tauri::command]
+fn get_log_dir(app_handle: tauri::AppHandle) -> Result<PathBuf, AppError> {
+    logger::logs_dir(&app_handle).map_err(|e| AppError::Internal(e.to_string()))
 }
 
 #[tauri::command]
@@ -666,6 +680,8 @@ pub fn run() {
             open_file_location,
             get_log_file_path,
             get_log_file_content,
+            clear_session_log,
+            get_log_dir,
             log_message,
         ])
         .run(tauri::generate_context!())

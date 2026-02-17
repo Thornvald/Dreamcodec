@@ -90,6 +90,7 @@ interface PreferenceCache {
   gpuPreference: string;
   cpuLimit: number;
   maxConcurrent: number;
+  outputDir: string;
 }
 
 interface HardwareCache {
@@ -100,7 +101,7 @@ interface HardwareCache {
 }
 
 const readPreferenceCache = (): PreferenceCache => {
-  const defaults: PreferenceCache = { encoder: "", gpuPreference: "auto", cpuLimit: 100, maxConcurrent: 3 };
+  const defaults: PreferenceCache = { encoder: "", gpuPreference: "auto", cpuLimit: 100, maxConcurrent: 3, outputDir: "" };
   if (typeof window === "undefined") return defaults;
 
   try {
@@ -120,6 +121,7 @@ const readPreferenceCache = (): PreferenceCache => {
       maxConcurrent: typeof parsed.maxConcurrent === "number" && parsed.maxConcurrent >= 1 && parsed.maxConcurrent <= 5
         ? parsed.maxConcurrent
         : 3,
+      outputDir: typeof parsed.outputDir === "string" ? parsed.outputDir : "",
     };
   } catch {
     return defaults;
@@ -135,6 +137,7 @@ const writePreferenceCache = (update: Partial<PreferenceCache>) => {
     gpuPreference: update.gpuPreference ?? current.gpuPreference,
     cpuLimit: update.cpuLimit ?? current.cpuLimit,
     maxConcurrent: update.maxConcurrent ?? current.maxConcurrent,
+    outputDir: update.outputDir ?? current.outputDir,
   };
 
   try {
@@ -200,7 +203,7 @@ const writeHardwareCache = (cpuInfo: CpuInfo | null, gpuInfo: GpuInfo) => {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState("queue");
-  const [outputDir, setOutputDir] = useState("");
+  const [outputDir, setOutputDir] = useState(() => readPreferenceCache().outputDir);
   const [encoder, setEncoder] = useState(() => readPreferenceCache().encoder);
   const [preset, setPreset] = useState("fast");
   const [outputFormat, setOutputFormat] = useState("mp4");
@@ -221,6 +224,7 @@ export default function App() {
   const [isDragOverlayVisible, setIsDragOverlayVisible] = useState(false);
   const [draggedFileCount, setDraggedFileCount] = useState(0);
   const conversionsRef = useRef<ConversionItem[]>([]);
+  const startingRef = useRef<Set<string>>(new Set());
   const pollerRef = useRef<number | null>(null);
   const [panicInfo, setPanicInfo] = useState<{ payload: string, location: string } | null>(null);
 
@@ -248,6 +252,12 @@ export default function App() {
   useEffect(() => {
     writePreferenceCache({ cpuLimit });
   }, [cpuLimit]);
+
+  useEffect(() => {
+    if (outputDir) {
+      writePreferenceCache({ outputDir });
+    }
+  }, [outputDir]);
 
   useEffect(() => {
     writePreferenceCache({ maxConcurrent });
@@ -883,12 +893,15 @@ export default function App() {
   const startNextPending = async () => {
     const current = conversionsRef.current;
     const activeCount = current.filter(c => c.status === "converting").length;
-    const pending = current.filter(c => c.status === "pending" && c.params);
-    const slotsAvailable = maxConcurrent - activeCount;
+    const starting = startingRef.current;
+    const pending = current.filter(c => c.status === "pending" && c.params && !starting.has(c.id));
+    const slotsAvailable = maxConcurrent - activeCount - starting.size;
 
     for (let i = 0; i < Math.min(slotsAvailable, pending.length); i++) {
       const item = pending[i];
+      starting.add(item.id);
       const taskId = await startPendingConversion(item);
+      starting.delete(item.id);
       if (taskId) {
         setConversions(prev => prev.map(c =>
           c.id === item.id ? { ...c, id: taskId, status: "converting" as ConversionStatus } : c
@@ -1008,23 +1021,8 @@ export default function App() {
 
     setConversions(prev => [...prev, ...newItems]);
     setQueue([]);
-
-    // Start up to maxConcurrent immediately
-    let started = 0;
-    for (const item of newItems) {
-      if (started >= maxConcurrent) break;
-      const taskId = await startPendingConversion(item);
-      if (taskId) {
-        setConversions(prev => prev.map(c =>
-          c.id === item.id ? { ...c, id: taskId, status: "converting" as ConversionStatus } : c
-        ));
-        started++;
-      } else {
-        setConversions(prev => prev.map(c =>
-          c.id === item.id ? { ...c, status: "failed" as ConversionStatus, failureMessage: "Failed to start" } : c
-        ));
-      }
-    }
+    // Items are added as "pending". The auto-start useEffect will pick them
+    // up and call startNextPending() to begin conversions.
   };
 
   const handleAddFiles = async () => {
@@ -1399,9 +1397,56 @@ export default function App() {
 
               {activeTab === "logs" && (
                 <div className="logs-panel">
-                  {logs.map((entry, index) => (
-                    <div key={`${entry}-${index}`} className="log-entry">{entry}</div>
-                  ))}
+                  <div className="logs-toolbar">
+                    <button
+                      className="btn btn-sm"
+                      onClick={async () => {
+                        try {
+                          await navigator.clipboard.writeText(logs.join("\n"));
+                          addLog("info", "Logs copied to clipboard.");
+                        } catch {
+                          addLog("error", "Failed to copy logs.");
+                        }
+                      }}
+                      title="Copy logs to clipboard"
+                    >
+                      <i className="ri-file-copy-line"></i> Copy Logs
+                    </button>
+                    <button
+                      className="btn btn-sm"
+                      onClick={async () => {
+                        try {
+                          await invoke("clear_session_log");
+                          setLogs([]);
+                          addLog("info", "Session log cleared.");
+                        } catch (err) {
+                          addLog("error", `Failed to clear logs: ${String(err)}`);
+                        }
+                      }}
+                      title="Clear session log"
+                    >
+                      <i className="ri-delete-bin-line"></i> Clear Logs
+                    </button>
+                    <button
+                      className="btn btn-sm"
+                      onClick={async () => {
+                        try {
+                          const logPath = await invoke<string>("get_log_file_path");
+                          await invoke("open_file_location", { filePath: logPath });
+                        } catch (err) {
+                          addLog("error", `Failed to open logs folder: ${String(err)}`);
+                        }
+                      }}
+                      title="Open logs folder"
+                    >
+                      <i className="ri-folder-open-line"></i> Open Logs Folder
+                    </button>
+                  </div>
+                  <div className="logs-entries">
+                    {logs.map((entry, index) => (
+                      <div key={`${entry}-${index}`} className="log-entry">{entry}</div>
+                    ))}
+                  </div>
                 </div>
               )}
             </div>
@@ -1409,7 +1454,7 @@ export default function App() {
         </div>
 
         <footer className="footer">
-          <i className="ri-video-fill"></i> Dreamcodec v2.2.6 • Made by Thornvald
+          <i className="ri-video-fill"></i> Dreamcodec v2.2.7 • Made by Thornvald
         </footer>
       </div>
     </>

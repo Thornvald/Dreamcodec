@@ -837,6 +837,54 @@ fn translate_nvenc_preset(cpu_preset: &str) -> String {
     }
 }
 
+/// Validate that an output file is actually playable by decoding a few frames.
+/// Returns `None` if the file looks good, or `Some(reason)` if it is corrupt.
+async fn validate_output(ffmpeg_path: &str, output_file: &str) -> Option<String> {
+    // Quick sanity check: file must exist and be non-empty.
+    match std::fs::metadata(output_file) {
+        Ok(meta) if meta.len() == 0 => return Some("Output file is empty".to_string()),
+        Err(e) => return Some(format!("Cannot stat output file: {}", e)),
+        _ => {}
+    }
+
+    // Decode up to 5 frames to /dev/null and inspect stderr for fatal errors.
+    let mut cmd = Command::new(ffmpeg_path);
+    cmd.args(&[
+        "-v", "error",
+        "-i", output_file,
+        "-frames:v", "5",
+        "-f", "null",
+        "-",
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let output = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) => return Some(format!("Validation probe failed to start: {}", e)),
+    };
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr_lower = stderr.to_lowercase();
+
+    // Check for signs of corrupt video data.
+    if stderr_lower.contains("invalid nal unit size")
+        || stderr_lower.contains("error splitting the input into nal units")
+        || stderr_lower.contains("non existing pps")
+        || stderr_lower.contains("no frame!")
+        || stderr_lower.contains("could not find codec parameters")
+        || stderr_lower.contains("invalid data found")
+        || stderr_lower.contains("unspecified pixel format")
+        || stderr_lower.contains("decode_slice_header error")
+    {
+        return Some(format!("Corrupt video stream detected: {}", stderr.lines().next().unwrap_or("unknown error")));
+    }
+
+    None
+}
+
 async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
     let (
         input_file,
@@ -874,11 +922,30 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
     let is_amf = encoder.contains("amf");
     let is_qsv = encoder.contains("qsv");
     let is_gpu_encoder = is_nvenc || is_amf || is_qsv;
-    let max_attempts: usize = if is_gpu_encoder { 3 } else { 1 };
+    // GPU encoders: 3 GPU attempts + 1 CPU software fallback = 4
+    // CPU encoders: 1 attempt only
+    let max_attempts: usize = if is_gpu_encoder { 4 } else { 1 };
+
+    // Determine the CPU fallback encoder that matches the GPU codec family.
+    let cpu_fallback_encoder = if encoder.contains("h264") || encoder.contains("264") {
+        "libx264"
+    } else if encoder.contains("hevc") || encoder.contains("265") {
+        "libx265"
+    } else {
+        "libx264"
+    };
 
     for attempt in 0..max_attempts {
+        let is_cpu_fallback = is_gpu_encoder && attempt == 3;
         let use_hw_decode = is_gpu_encoder && attempt == 0;
         let force_nv12 = is_gpu_encoder && attempt == 2;
+
+        // Pick the encoder for this attempt.
+        let attempt_encoder = if is_cpu_fallback {
+            cpu_fallback_encoder.to_string()
+        } else {
+            encoder.clone()
+        };
 
         let mut args = vec![
             "-y".to_string(),
@@ -910,8 +977,11 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
         args.push(input_file.clone());
 
         if format_info.supports_video {
+            // Map only the first video stream to avoid picking up embedded
+            // thumbnails / cover art (e.g. MJPEG attached pics) that would
+            // cause container errors when re-encoded.
             args.push("-map".to_string());
-            args.push("0:v?".to_string());
+            args.push("0:v:0?".to_string());
         }
         if format_info.supports_audio {
             args.push("-map".to_string());
@@ -922,7 +992,7 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
             }
         }
 
-        if is_adobe_preset {
+        if is_adobe_preset && !is_cpu_fallback {
             if let Some(ref preset_config) = adobe_preset {
                 args.push("-c:v".to_string());
                 args.push(preset_config.encoder.clone());
@@ -937,17 +1007,15 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
         } else {
             if format_info.supports_video {
                 args.push("-c:v".to_string());
-                args.push(encoder.clone());
-                if is_nvenc || encoder == "libx264" || encoder == "libx265" {
+                args.push(attempt_encoder.clone());
+                if is_nvenc && !is_cpu_fallback {
                     args.push("-preset".to_string());
-                    let preset_value = if is_nvenc {
-                        translate_nvenc_preset(&preset)
-                    } else {
-                        preset.clone()
-                    };
-                    args.push(preset_value);
+                    args.push(translate_nvenc_preset(&preset));
+                } else if attempt_encoder == "libx264" || attempt_encoder == "libx265" {
+                    args.push("-preset".to_string());
+                    args.push(preset.clone());
                 }
-                if is_nvenc {
+                if is_nvenc && !is_cpu_fallback {
                     if let Some(index) = gpu_index {
                         args.push("-gpu".to_string());
                         args.push(index.to_string());
@@ -968,6 +1036,13 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
             }
         }
 
+        // Place the moov atom at the start of MP4/MOV files so players can
+        // open the file without reading until the very end.
+        if output_ext == "mp4" || output_ext == "mov" || output_ext == "m4a" {
+            args.push("-movflags".to_string());
+            args.push("+faststart".to_string());
+        }
+
         args.push(output_file.clone());
 
         {
@@ -976,6 +1051,10 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
             let log_msg = match attempt {
                 1 => "Retrying with software decode + GPU encode...",
                 2 => "Retrying with forced NV12 pixel format...",
+                3 => {
+                    info!("GPU encode failed. Falling back to CPU software encoder: {}", cpu_fallback_encoder);
+                    "GPU encode failed. Falling back to CPU software encoder..."
+                }
                 _ if is_gpu_encoder => {
                     let hw_label = if is_nvenc {
                         "NVENC + CUDA hardware decode"
@@ -996,7 +1075,7 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
 
         info!("=== FFmpeg Start (attempt {}) ===", attempt + 1);
         info!("FFmpeg path: {}", ffmpeg_path);
-        info!("Encoder: {}", encoder);
+        info!("Encoder: {}", attempt_encoder);
         info!("Input: {}", input_file);
         info!("Output: {}", output_file);
         debug!("Args: {:?}", args);
@@ -1088,9 +1167,7 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
             task.pid = None;
             match status {
                 Ok(exit_status) if exit_status.success() => {
-                    info!("FFmpeg task completed successfully for {}", input_file);
-                    task.progress.status = ConversionStatus::Completed;
-                    task.progress.percentage = 100.0;
+                    info!("FFmpeg exited successfully for {}", input_file);
                     true
                 }
                 Ok(exit_status) => {
@@ -1113,7 +1190,32 @@ async fn run_conversion_task(task_arc: Arc<Mutex<ConversionTask>>) {
             }
         };
 
+        // If FFmpeg reported success, validate the output file is actually playable.
+        // GPU encoders (especially AMF) can produce corrupt output while still
+        // returning exit code 0.
         if succeeded {
+            if let Some(problem) = validate_output(&ffmpeg_path, &output_file).await {
+                warn!("Output validation failed for {}: {}", output_file, problem);
+                let mut task = task_arc.lock().expect("Failed to lock task mutex");
+                task.progress.log.push(format!("Output validation failed: {}. Retrying...", problem));
+                if attempt < max_attempts - 1 {
+                    // Not the last attempt — remove corrupt file and retry
+                    let _ = std::fs::remove_file(&output_file);
+                    continue;
+                } else {
+                    // Last attempt also produced bad output
+                    let err_msg = format!("Conversion produced corrupt output: {}", problem);
+                    task.progress.status = ConversionStatus::Failed(err_msg.clone());
+                    task.progress.error_message = Some(err_msg);
+                    return;
+                }
+            }
+
+            // Output is valid — mark completed
+            let mut task = task_arc.lock().expect("Failed to lock task mutex");
+            info!("Conversion completed and validated for {}", input_file);
+            task.progress.status = ConversionStatus::Completed;
+            task.progress.percentage = 100.0;
             return;
         }
 

@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.7] - 2026-02-17
+
+### Fixed
+- Converted MP4/MOV videos now play correctly in VLC and other players (`-movflags +faststart`)
+- Videos with embedded thumbnails (MJPEG attached pics) no longer cause conversion failures
+- Fixed race condition where the same file could be started twice, corrupting the output
+
+### Added
+- Post-conversion output validation detects corrupt video streams and auto-retries
+- Automatic CPU software fallback (libx264/libx265) when GPU encoder produces invalid output
+- Per-session log files stored in a `logs/` folder with timestamps
+- Copy Logs, Clear Logs, and Open Logs Folder buttons in the Logs tab
+- Output directory is now remembered across app restarts
+
 ## [2.2.5] - 2026-02-10
 
 ### Fixed
